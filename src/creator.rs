@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::error::{Par2Error, Result};
 use crate::format::Md5Hash;
 use crate::galois_simd::{detect_dispatch, gf_mul_xor_dispatch, Dispatch};
@@ -262,11 +264,29 @@ fn build_volume_file(
             slice_buf[filled..].fill(0);
         }
 
-        // Accumulate into every recovery buffer.
-        for (r_idx, out) in recovery_buffers.iter_mut().enumerate() {
-            let coeff = rs.coefficient(r_idx, input_idx);
-            gf_mul_xor_dispatch(dispatch, coeff, &slice_buf, out);
-        }
+        // Accumulate into every recovery buffer. Each buffer is disjoint, so
+        // rayon hands out exclusive `&mut [u8]` slots with zero locking. `rs`
+        // and `dispatch` are `&`/`Copy`, and `slice_buf` is read-only here.
+        //
+        // Split the recovery_buffers slice into roughly one chunk per worker
+        // thread. Per-buffer work is ~50 µs of SIMD; scheduling each buffer as
+        // its own task would have rayon's scheduler dominate the runtime,
+        // especially at low thread counts. Chunked iteration keeps task count
+        // == thread count and lets each task run a tight serial inner loop.
+        let slice_ref: &[u8] = &slice_buf;
+        let workers = rayon::current_num_threads().max(1);
+        let chunk_len = recovery_buffers.len().div_ceil(workers).max(1);
+        recovery_buffers
+            .par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base = chunk_idx * chunk_len;
+                for (offset, out) in chunk.iter_mut().enumerate() {
+                    let r_idx = base + offset;
+                    let coeff = rs.coefficient(r_idx, input_idx);
+                    gf_mul_xor_dispatch(dispatch, coeff, slice_ref, out);
+                }
+            });
     }
     drop(current_file);
 

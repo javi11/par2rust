@@ -43,6 +43,10 @@ struct CreateArgs {
     #[arg(long = "single-volume", default_value_t = false)]
     single_volume: bool,
 
+    /// Number of worker threads. 0 = auto (one per logical CPU).
+    #[arg(short = 't', long = "threads", default_value_t = 0)]
+    threads: usize,
+
     /// Output PAR2 archive name. Volume files are derived from this name.
     archive: PathBuf,
 
@@ -67,6 +71,15 @@ fn main() -> ExitCode {
 fn run_create_cli(args: CreateArgs) -> Result<(), Par2Error> {
     if args.recovery_count > MAX_RECOVERY_BLOCKS {
         return Err(Par2Error::TooManyRecoveryBlocks(args.recovery_count));
+    }
+
+    if args.threads > 0 {
+        if let Err(e) = rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global()
+        {
+            eprintln!("par2rust: warning: could not configure thread pool: {e}");
+        }
     }
 
     // Scan every input file before writing anything.
