@@ -14,11 +14,7 @@ fn main() -> par2rust::Result<()> {
     let data_path = dir.path().join("data.bin");
     fs::write(&data_path, b"par2rust library API example payload")?;
 
-    let display_name = data_path
-        .file_name()
-        .unwrap()
-        .as_encoded_bytes()
-        .to_vec();
+    let display_name = data_path.file_name().unwrap().as_encoded_bytes().to_vec();
     let source = SourceFile::scan(&data_path, display_name, 4096)?;
 
     let output = dir.path().join("backup.par2");
@@ -31,7 +27,11 @@ fn main() -> par2rust::Result<()> {
         &[source],
     )?;
 
-    println!("Generated {} PAR2 file(s) in {}:", written.len(), dir.path().display());
+    println!(
+        "Generated {} PAR2 file(s) in {}:",
+        written.len(),
+        dir.path().display()
+    );
     for p in &written {
         let size = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
         println!("  {} ({} bytes)", p.display(), size);
