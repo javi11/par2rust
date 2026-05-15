@@ -53,6 +53,56 @@ par2 v backup.par2          # verify
 par2 r backup.par2          # repair if any data file is damaged
 ```
 
+## Use as a library
+
+`par2rust` is also a regular Rust crate. Add it with the default `cli`
+feature disabled so `clap` isn't pulled into your dependency tree:
+
+```toml
+[dependencies]
+par2rust = { version = "0.1", default-features = false }
+```
+
+Call `run_create` directly:
+
+```rust
+use std::path::PathBuf;
+use par2rust::{run_create, CreateOptions, SourceFile};
+
+fn main() -> par2rust::Result<()> {
+    let path = PathBuf::from("data.bin");
+    let name = path.file_name().unwrap().as_encoded_bytes().to_vec();
+    let source = SourceFile::scan(&path, name, 4096)?;
+
+    let written = run_create(
+        &CreateOptions {
+            output: PathBuf::from("backup.par2"),
+            slice_size: 4096,
+            recovery_block_count: 10,
+        },
+        &[source],
+    )?;
+    for p in &written {
+        println!("wrote {}", p.display());
+    }
+    Ok(())
+}
+```
+
+A runnable version lives at [`examples/create_from_lib.rs`](examples/create_from_lib.rs):
+
+```bash
+cargo run --example create_from_lib
+```
+
+Public API surface:
+
+- `run_create(&CreateOptions, &[SourceFile]) -> Result<Vec<PathBuf>>` — full create pipeline
+- `SourceFile::scan(path, display_name, slice_size)` — hash one input file
+- `CreateOptions { output, slice_size, recovery_block_count }`
+- Errors via `Par2Error` (`thiserror`-derived)
+- Constants: `MAX_FILES`, `MAX_RECOVERY_BLOCKS`
+
 ## Performance
 
 On Apple Silicon (M-series), single-threaded, vs. upstream `par2cmdline` with OpenMP:
