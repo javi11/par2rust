@@ -7,15 +7,17 @@ quickpar, multipar) can verify and repair files using the output.
 
 ## Status
 
-- ✅ PAR2 create: index file + single-volume recovery file
+- ✅ PAR2 create: index file + multi-volume recovery files (exponential
+  split by default, single-volume via `--single-volume`)
 - ✅ Reed-Solomon GF(2¹⁶) encoder with PAR2 generator `0x1100B`
 - ✅ SIMD acceleration:
   - **NEON** on `aarch64` (Apple Silicon, ARM servers)
   - **SSSE3** on `x86_64`
   - Byte-table scalar fallback elsewhere
+- ✅ Windows long-path support (`\\?\` prefix for paths >260 chars)
 - ✅ Golden tests against upstream `par2 v` and `par2 r`
-- 🚧 **Not implemented**: verify, repair, PAR1 legacy format, multi-volume
-  distribution schemes, Windows wide-char path handling
+- 🚧 **Not implemented**: verify, repair, PAR1 legacy format,
+  par2cmdline's `-u`/`-l` distribution flags (uniform / limit-count)
 
 ## Install / build
 
@@ -39,11 +41,23 @@ par2rust create -s 262144 -c 50 backup.par2 data.bin
 par2rust c -s 4096 -c 10 backup.par2 a.bin b.bin c.bin
 ```
 
-Output:
+Output (default — `par2cmdline`-style exponential split):
 ```
-Wrote 2 files:
+Wrote 8 files:
   backup.par2 (552 bytes)
-  backup.vol0+50.par2 (13_127_384 bytes)
+  backup.vol0+1.par2 ...
+  backup.vol1+1.par2 ...
+  backup.vol2+2.par2 ...
+  backup.vol4+4.par2 ...
+  backup.vol8+8.par2 ...
+  backup.vol16+16.par2 ...
+  backup.vol32+18.par2 ...
+```
+
+To collapse into a single recovery file (the previous default), pass
+`--single-volume`:
+```bash
+par2rust create --single-volume -s 262144 -c 50 backup.par2 data.bin
 ```
 
 Verify and repair with upstream tools:
@@ -79,6 +93,7 @@ fn main() -> par2rust::Result<()> {
             output: PathBuf::from("backup.par2"),
             slice_size: 4096,
             recovery_block_count: 10,
+            ..Default::default()
         },
         &[source],
     )?;
@@ -99,7 +114,8 @@ Public API surface:
 
 - `run_create(&CreateOptions, &[SourceFile]) -> Result<Vec<PathBuf>>` — full create pipeline
 - `SourceFile::scan(path, display_name, slice_size)` — hash one input file
-- `CreateOptions { output, slice_size, recovery_block_count }`
+- `CreateOptions { output, slice_size, recovery_block_count, volume_scheme }`
+- `VolumeScheme::{Single, Exponential, Explicit(Vec<u32>)}` — recovery-file split
 - Errors via `Par2Error` (`thiserror`-derived)
 - Constants: `MAX_FILES`, `MAX_RECOVERY_BLOCKS`
 

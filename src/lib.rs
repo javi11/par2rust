@@ -18,6 +18,7 @@
 //!         output: PathBuf::from("backup.par2"),
 //!         slice_size: 4096,
 //!         recovery_block_count: 10,
+//!         ..Default::default()
 //!     },
 //!     &[source],
 //! )?;
@@ -47,6 +48,8 @@ pub mod packet;
 pub mod reedsolomon;
 pub mod source;
 
-pub use creator::{run_create, write_index_file, CreateOptions, MAX_FILES, MAX_RECOVERY_BLOCKS};
+pub use creator::{
+    run_create, write_index_file, CreateOptions, VolumeScheme, MAX_FILES, MAX_RECOVERY_BLOCKS,
+};
 pub use error::{Par2Error, Result};
 pub use source::SourceFile;

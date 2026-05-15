@@ -3,7 +3,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use par2rust::{run_create, CreateOptions, Par2Error, SourceFile, MAX_RECOVERY_BLOCKS};
+use par2rust::{
+    run_create, CreateOptions, Par2Error, SourceFile, VolumeScheme, MAX_RECOVERY_BLOCKS,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -34,6 +36,12 @@ struct CreateArgs {
     /// Number of recovery blocks to generate.
     #[arg(short = 'c', long = "recovery-count", default_value_t = 0)]
     recovery_count: u32,
+
+    /// Emit a single `vol0+N.par2` containing all recovery blocks instead of
+    /// par2cmdline's default exponential split (`vol0+1`, `vol1+1`, `vol2+2`,
+    /// `vol4+4`, …).
+    #[arg(long = "single-volume", default_value_t = false)]
+    single_volume: bool,
 
     /// Output PAR2 archive name. Volume files are derived from this name.
     archive: PathBuf,
@@ -69,11 +77,18 @@ fn run_create_cli(args: CreateArgs) -> Result<(), Par2Error> {
         sources.push(src);
     }
 
+    let volume_scheme = if args.single_volume {
+        VolumeScheme::Single
+    } else {
+        VolumeScheme::Exponential
+    };
+
     let written = run_create(
         &CreateOptions {
             output: args.archive.clone(),
             slice_size: args.slice_size,
             recovery_block_count: args.recovery_count,
+            volume_scheme,
         },
         &sources,
     )?;
