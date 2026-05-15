@@ -121,15 +121,29 @@ Public API surface:
 
 ## Performance
 
-On Apple Silicon (M-series), single-threaded, vs. upstream `par2cmdline` with OpenMP:
+`par2rust` parallelises the Reed-Solomon accumulator with `rayon` (chunked per
+worker thread to keep scheduling overhead negligible). Pass `-t/--threads N` to
+pin the worker count; `0` (default) uses one per logical CPU.
 
-| Workload                  | par2cmdline (OpenMP) | par2rust (single-thread) |
-|---------------------------|----------------------|--------------------------|
-| 100 MB → 50 recovery blocks | 0.69 s wall / 1.62 s CPU | **0.54 s wall / 0.49 s CPU** |
+Benchmark — Apple M4, 10 cores, macOS 25.3, 16 GB RAM. Workload: a 513 MB MKV
+file with `-s 524288 -c 200` (~10% redundancy, multi-volume exponential split).
+Best of 3 runs:
 
-`par2rust` is single-threaded but beats the multi-threaded C++ implementation
-on wall-clock time thanks to the NEON GF(2¹⁶) multiplier. Per-core CPU time is
-roughly 3.3× faster.
+| Tool                             | Wall   | User CPU | Notes                            |
+|----------------------------------|-------:|---------:|----------------------------------|
+| `par2rust create` (default, 10 threads) | **4.55 s** | 13.50 s  | this crate                       |
+| `par2cmdline 1.1.1` (OpenMP)     | 6.18 s | 25.03 s  | upstream reference               |
+| `par2rust create -t 1`           | 7.16 s | 6.49 s   | single-threaded baseline         |
+
+Result on this hardware: **~26% faster wall-clock than par2cmdline** while using
+**~46% less CPU time** (≈3.9× more cycle-efficient per unit of wall time). The
+single-threaded mode still beats par2cmdline's *per-core* throughput by ~3.5×
+thanks to the NEON GF(2¹⁶) multiplier.
+
+Scaling on this workload plateaus around 4 threads — at 200 × 524 KB recovery
+buffers (≈105 MB live) the inner loop becomes memory-bandwidth-bound rather
+than compute-bound. Tune `slice-size` / `recovery-count` to fit your CPU's
+shared cache for best results.
 
 ## Architecture
 
