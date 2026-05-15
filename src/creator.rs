@@ -665,17 +665,20 @@ mod tests {
     }
 
     /// Relative paths must be joined onto the supplied cwd before being
-    /// prefixed — `\\?\rel` would be meaningless to Win32.
+    /// prefixed — `\\?\rel` would be meaningless to Win32. The exact
+    /// separator characters depend on the host (`PathBuf::join` keeps the
+    /// cwd's separators and introduces its own between segments), so we
+    /// assert on substrings rather than a fixed suffix.
     #[test]
     fn apply_long_path_prefix_absolutises_relative_path_against_cwd() {
         let cwd = Path::new("/work/dir");
         let out = apply_long_path_prefix(Path::new("sub/file.par2"), cwd);
         let s = out.to_string_lossy();
         assert!(s.starts_with(r"\\?\"), "missing \\\\?\\ prefix: {s}");
-        assert!(
-            s.ends_with("/work/dir/sub/file.par2") || s.ends_with(r"\work\dir\sub\file.par2"),
-            "did not append cwd: {s}",
-        );
+        assert!(s.contains("work"), "cwd not appended: {s}");
+        assert!(s.contains("dir"), "cwd not appended: {s}");
+        assert!(s.contains("sub"), "relative path not appended: {s}");
+        assert!(s.contains("file.par2"), "relative path not appended: {s}");
     }
 
     /// Already-absolute paths get the prefix applied directly without
