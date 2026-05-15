@@ -6,15 +6,26 @@ rust-version = "1.74"
 description = "PAR2 file create-only port of par2cmdline in Rust"
 license = "GPL-2.0-or-later"
 
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
 [dependencies]
 md-5 = "0.10"
 crc32fast = "1.4"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 thiserror = "1"
 cpufeatures = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bin]]
+name = "par2rust"
+required-features = ["cli"]
+
+[[example]]
+name = "create_from_lib"
 
 [profile.release]
 opt-level = 3
