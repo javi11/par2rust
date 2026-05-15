@@ -1,9 +1,7 @@
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-
-#[cfg(windows)]
-use std::ffi::OsString;
 
 use crate::error::{Par2Error, Result};
 use crate::format::Md5Hash;
@@ -341,26 +339,35 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// On non-Windows platforms this is a no-op pass-through.
 #[cfg(windows)]
 fn to_long_path(path: &Path) -> PathBuf {
-    let s = path.as_os_str();
-    let bytes = s.as_encoded_bytes();
-    // Already a verbatim or device path — leave it alone.
-    if bytes.starts_with(br"\\?\") || bytes.starts_with(br"\\.\") {
-        return path.to_path_buf();
-    }
-    // Resolve to an absolute path so the prefix is meaningful. We can't use
-    // std::fs::canonicalize here because the output file doesn't exist yet.
-    let abs = match std::env::current_dir() {
-        Ok(cwd) if path.is_relative() => cwd.join(path),
-        _ => path.to_path_buf(),
-    };
-    let mut prefixed = OsString::from(r"\\?\");
-    prefixed.push(abs.as_os_str());
-    PathBuf::from(prefixed)
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::new());
+    apply_long_path_prefix(path, &cwd)
 }
 
 #[cfg(not(windows))]
 fn to_long_path(path: &Path) -> PathBuf {
     path.to_path_buf()
+}
+
+/// Pure path-prefixing logic, factored out so it can be unit-tested on any
+/// platform. Used by [`to_long_path`] on Windows.
+///
+/// - Verbatim (`\\?\`) and device (`\\.\`) prefixes are returned unchanged.
+/// - Relative paths are joined onto `cwd` before being prefixed.
+/// - Absolute paths get the prefix applied directly.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn apply_long_path_prefix(path: &Path, cwd: &Path) -> PathBuf {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.starts_with(br"\\?\") || bytes.starts_with(br"\\.\") {
+        return path.to_path_buf();
+    }
+    let abs = if path.is_relative() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let mut prefixed = OsString::from(r"\\?\");
+    prefixed.push(abs.as_os_str());
+    PathBuf::from(prefixed)
 }
 
 #[cfg(test)]
@@ -632,19 +639,86 @@ mod tests {
         assert_eq!(to_long_path(p), PathBuf::from("/tmp/a.bin"));
     }
 
-    #[cfg(windows)]
+    /// Verbatim-prefixed paths must round-trip unchanged so we don't end up
+    /// double-prefixing like `\\?\\\?\C:\foo`. Runs on every platform since
+    /// the byte-level prefix check is OS-independent.
     #[test]
-    fn to_long_path_leaves_verbatim_paths_alone() {
+    fn apply_long_path_prefix_leaves_verbatim_paths_unchanged() {
+        let cwd = Path::new("/cwd/should/be/ignored");
         let p = Path::new(r"\\?\C:\foo\bar");
-        assert_eq!(to_long_path(p), PathBuf::from(r"\\?\C:\foo\bar"));
+        assert_eq!(
+            apply_long_path_prefix(p, cwd),
+            PathBuf::from(r"\\?\C:\foo\bar")
+        );
     }
 
-    #[cfg(windows)]
+    /// Device paths (`\\.\PhysicalDrive0`, `\\.\COM1`) are also already in a
+    /// form Win32 accepts and must not be wrapped.
     #[test]
-    fn to_long_path_prefixes_plain_absolute_path() {
-        let p = Path::new(r"C:\some\dir\file.par2");
-        let out = to_long_path(p);
+    fn apply_long_path_prefix_leaves_device_paths_unchanged() {
+        let cwd = Path::new("/cwd");
+        let p = Path::new(r"\\.\PhysicalDrive0");
+        assert_eq!(
+            apply_long_path_prefix(p, cwd),
+            PathBuf::from(r"\\.\PhysicalDrive0")
+        );
+    }
+
+    /// Relative paths must be joined onto the supplied cwd before being
+    /// prefixed — `\\?\rel` would be meaningless to Win32.
+    #[test]
+    fn apply_long_path_prefix_absolutises_relative_path_against_cwd() {
+        let cwd = Path::new("/work/dir");
+        let out = apply_long_path_prefix(Path::new("sub/file.par2"), cwd);
         let s = out.to_string_lossy();
-        assert!(s.starts_with(r"\\?\"), "expected \\\\?\\ prefix, got {s}");
+        assert!(s.starts_with(r"\\?\"), "missing \\\\?\\ prefix: {s}");
+        assert!(
+            s.ends_with("/work/dir/sub/file.par2") || s.ends_with(r"\work\dir\sub\file.par2"),
+            "did not append cwd: {s}",
+        );
+    }
+
+    /// Already-absolute paths get the prefix applied directly without
+    /// touching the cwd.
+    #[test]
+    fn apply_long_path_prefix_does_not_touch_cwd_for_absolute_path() {
+        let cwd = Path::new("/should/not/appear");
+        let p = if cfg!(windows) {
+            Path::new(r"C:\some\dir\file.par2")
+        } else {
+            Path::new("/some/dir/file.par2")
+        };
+        let out = apply_long_path_prefix(p, cwd);
+        let s = out.to_string_lossy();
+        assert!(s.starts_with(r"\\?\"));
+        assert!(
+            !s.contains("should/not/appear"),
+            "cwd leaked into absolute path: {s}"
+        );
+    }
+
+    /// Idempotency: applying the helper to its own output is a no-op because
+    /// the result already starts with `\\?\`. Guards against accidentally
+    /// double-prefixing across nested calls.
+    #[test]
+    fn apply_long_path_prefix_is_idempotent() {
+        let cwd = Path::new("/cwd");
+        let first = apply_long_path_prefix(Path::new("a/b/c.par2"), cwd);
+        let second = apply_long_path_prefix(&first, cwd);
+        assert_eq!(first, second);
+    }
+
+    /// Long path (>260 chars) gets prefixed cleanly — the very case the
+    /// `\\?\` wrapper exists to enable on Windows.
+    #[test]
+    fn apply_long_path_prefix_handles_paths_longer_than_max_path() {
+        let cwd = Path::new("/base");
+        // A 300-char path component, well past Win32's 260-char MAX_PATH.
+        let long_segment: String = "a".repeat(300);
+        let p = PathBuf::from(format!("dir/{long_segment}.par2"));
+        let out = apply_long_path_prefix(&p, cwd);
+        let s = out.to_string_lossy();
+        assert!(s.starts_with(r"\\?\"), "missing prefix: {s}");
+        assert!(s.len() > 260, "expected >260 chars, got {}", s.len());
     }
 }
