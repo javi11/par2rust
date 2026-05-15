@@ -173,7 +173,3 @@ The golden suite covers:
 - Single-file corruption-and-repair round trip
 - Multi-file corruption-and-repair round trip
 - CLI end-to-end (subprocess invocation of our binary)
-
-## License
-
-GPL-2.0-or-later, matching the upstream par2cmdline project.
