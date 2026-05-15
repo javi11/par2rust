@@ -148,11 +148,7 @@ mod neon {
     /// is for documentation and to allow the compiler to assume NEON
     /// instructions are legal here.
     #[target_feature(enable = "neon")]
-    pub unsafe fn gf_mul_xor_neon(
-        tables: &NeonTables,
-        input: &[u8],
-        output: &mut [u8],
-    ) {
+    pub unsafe fn gf_mul_xor_neon(tables: &NeonTables, input: &[u8], output: &mut [u8]) {
         debug_assert_eq!(input.len(), output.len());
         debug_assert_eq!(input.len() % 2, 0);
 
@@ -171,42 +167,9 @@ mod neon {
 
         let mask_low_nibble = vdupq_n_u8(0x0F);
 
-        let full_chunks = input.len() / 16;
-        for chunk in 0..full_chunks {
-            let off = chunk * 16;
-            // Load 16 bytes. Per PAR2, bytes alternate low/high of consecutive
-            // GF symbols. Use `vld2q_u8` to deinterleave them into separate
-            // "low byte" and "high byte" vectors, each 16 lanes wide. (Wait —
-            // 16 bytes deinterleaved into two vectors = 16 lanes total = 16
-            // bytes per vector; that's a 32-byte load. So instead we hand-load
-            // 16 bytes and process them as 8 symbols, applying the same
-            // mechanism per lane.)
-            //
-            // Simpler implementation: just two `vld1q_u8` loads on adjacent
-            // bytes is overkill. We pack 16 bytes as two interleaved streams
-            // by masking and shifting.
-            //
-            // Actually for 16 bytes = 8 symbols, the layout in memory is:
-            // [s0_lo, s0_hi, s1_lo, s1_hi, ..., s7_lo, s7_hi]. Using `vld2q_u8`
-            // requires aligned loads; we'd rather load all 16 bytes once and
-            // use byte-shuffle to split. Use `vuzp1q_u8` / `vuzp2q_u8` on two
-            // copies (one shifted by 1 byte) — but that needs 32 bytes input.
-            //
-            // The clean approach: process 32 bytes (== 16 symbols) per
-            // iteration with a single `vld2q_u8` which deinterleaves natively.
-            // Fall through to per-symbol fallback for the trailing < 32 bytes.
-            //
-            // For simplicity in v1, we keep the 16-byte-per-iteration loop and
-            // synthesise the deinterleave via two narrow loads, accepting the
-            // small ILP loss. NEON tables themselves do the heavy lifting.
-
-            // Re-implement the chunk loop on 32 bytes — see the next loop.
-            let _ = (off, t_lo_lo, t_lo_hi, t_lo_lo_n16, t_lo_hi_n16,
-                     t_hi_lo, t_hi_hi, t_hi_lo_n16, t_hi_hi_n16, mask_low_nibble);
-            break; // unused — see below
-        }
-
-        // Wide loop: 32 bytes (16 symbols) per iteration, native deinterleave.
+        // Wide loop: 32 bytes (16 symbols) per iteration, with native
+        // deinterleave via `vld2q_u8`. The trailing < 32 bytes are handled by
+        // the byte-table scalar fallback below.
         let wide_chunks = input.len() / 32;
         let mut consumed = 0usize;
         for chunk in 0..wide_chunks {
@@ -269,11 +232,7 @@ pub use neon::{gf_mul_xor_neon, NeonTables};
 /// back to the byte-table scalar path. We reconstruct the byte tables from the
 /// nibble tables to avoid carrying both representations through the encoder.
 #[cfg(target_arch = "aarch64")]
-fn gf_mul_xor_table_scalar_from_neon_tables(
-    nt: &NeonTables,
-    input: &[u8],
-    output: &mut [u8],
-) {
+fn gf_mul_xor_table_scalar_from_neon_tables(nt: &NeonTables, input: &[u8], output: &mut [u8]) {
     debug_assert_eq!(input.len() % 2, 0);
     for k in 0..(input.len() / 2) {
         let lb = input[2 * k];
@@ -313,8 +272,14 @@ mod x86 {
     impl X86Tables {
         pub fn from_coeff_tables(byte_tables: &CoeffTables) -> Self {
             let mut t = X86Tables {
-                lo_lo: [0; 16], lo_hi: [0; 16], lo_lo_n16: [0; 16], lo_hi_n16: [0; 16],
-                hi_lo: [0; 16], hi_hi: [0; 16], hi_lo_n16: [0; 16], hi_hi_n16: [0; 16],
+                lo_lo: [0; 16],
+                lo_hi: [0; 16],
+                lo_lo_n16: [0; 16],
+                lo_hi_n16: [0; 16],
+                hi_lo: [0; 16],
+                hi_hi: [0; 16],
+                hi_lo_n16: [0; 16],
+                hi_hi_n16: [0; 16],
             };
             for n in 0..16usize {
                 let low_only = byte_tables.lo[n];
@@ -359,12 +324,8 @@ mod x86 {
         // 16 symbols) into two 16-byte vectors of low bytes and high bytes.
         // SSSE3 has no `pshufb` across two registers, so we do two loads and
         // shuffle each, then combine.
-        let lo_idx = _mm_set_epi8(
-            14, 12, 10, 8, 6, 4, 2, 0, -1, -1, -1, -1, -1, -1, -1, -1,
-        );
-        let hi_idx = _mm_set_epi8(
-            15, 13, 11, 9, 7, 5, 3, 1, -1, -1, -1, -1, -1, -1, -1, -1,
-        );
+        let lo_idx = _mm_set_epi8(14, 12, 10, 8, 6, 4, 2, 0, -1, -1, -1, -1, -1, -1, -1, -1);
+        let hi_idx = _mm_set_epi8(15, 13, 11, 9, 7, 5, 3, 1, -1, -1, -1, -1, -1, -1, -1, -1);
 
         let chunks = input.len() / 32;
         let mut consumed = 0usize;
@@ -441,11 +402,7 @@ mod x86 {
 pub use x86::{gf_mul_xor_ssse3, X86Tables};
 
 #[cfg(target_arch = "x86_64")]
-fn gf_mul_xor_table_scalar_from_x86_tables(
-    nt: &X86Tables,
-    input: &[u8],
-    output: &mut [u8],
-) {
+fn gf_mul_xor_table_scalar_from_x86_tables(nt: &X86Tables, input: &[u8], output: &mut [u8]) {
     for k in 0..(input.len() / 2) {
         let lb = input[2 * k];
         let hb = input[2 * k + 1];
@@ -496,12 +453,7 @@ pub fn detect_dispatch() -> Dispatch {
 
 /// Apply `output ^= coeff · input` using the best available path. This is the
 /// safe public entrypoint that all SIMD `unsafe` work is funneled through.
-pub fn gf_mul_xor_dispatch(
-    dispatch: Dispatch,
-    coeff: u16,
-    input: &[u8],
-    output: &mut [u8],
-) {
+pub fn gf_mul_xor_dispatch(dispatch: Dispatch, coeff: u16, input: &[u8], output: &mut [u8]) {
     if coeff == 0 {
         return;
     }
@@ -533,7 +485,6 @@ pub fn gf_mul_xor_dispatch(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,7 +493,9 @@ mod tests {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             out.push((state >> 33) as u8);
         }
         out
@@ -556,9 +509,12 @@ mod tests {
         gf_mul_xor_dispatch(dispatch, coeff, input, &mut out_other);
 
         assert_eq!(
-            out_scalar, out_other,
+            out_scalar,
+            out_other,
             "dispatch {:?} diverged from scalar for coeff=0x{:04X}, len={}",
-            dispatch, coeff, input.len(),
+            dispatch,
+            coeff,
+            input.len(),
         );
     }
 
@@ -597,7 +553,9 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_matches_scalar_for_random_coeffs_and_lengths() {
-        let coeffs = [0x0002u16, 0x00FF, 0x0100, 0x1234, 0x8000, 0xABCD, 0xFFFE, 0xFFFF];
+        let coeffs = [
+            0x0002u16, 0x00FF, 0x0100, 0x1234, 0x8000, 0xABCD, 0xFFFE, 0xFFFF,
+        ];
         // Mix of clean multiples of 32 and trailing fragments.
         let lengths = [2usize, 4, 16, 30, 32, 34, 62, 64, 96, 100, 1024, 4096, 4098];
         for &coeff in &coeffs {

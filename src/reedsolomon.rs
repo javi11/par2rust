@@ -19,7 +19,7 @@
 //! bytes as little-endian GF(2^16) symbols. PAR2 requires `slice_size % 4 == 0`,
 //! so the byte count is always even.
 
-use crate::galois::{gf_pow, gf16_tables, FIELD_LIMIT};
+use crate::galois::{gf16_tables, gf_pow, FIELD_LIMIT};
 
 /// Builder/holder for a PAR2 RS encoding context.
 pub struct RsEncoder {
@@ -45,7 +45,10 @@ impl RsEncoder {
                 e as u16
             })
             .collect();
-        RsEncoder { input_bases, recovery_exponents }
+        RsEncoder {
+            input_bases,
+            recovery_exponents,
+        }
     }
 
     /// Look up the matrix coefficient for (recovery row, input column).
@@ -67,7 +70,11 @@ impl RsEncoder {
         output: &mut [u8],
     ) {
         assert_eq!(input.len(), output.len(), "buffer length mismatch");
-        assert_eq!(input.len() % 2, 0, "buffer length must be even (16-bit symbols)");
+        assert_eq!(
+            input.len() % 2,
+            0,
+            "buffer length must be even (16-bit symbols)"
+        );
 
         let coeff = self.coefficient(recovery_idx, input_idx);
         gf_mul_xor_scalar(coeff, input, output);
@@ -106,7 +113,11 @@ pub fn gf_mul_xor_scalar(coeff: u16, input: &[u8], output: &mut [u8]) {
             0
         } else {
             let sum = log_coeff + t.log[sym as usize] as u32;
-            let idx = if sum >= FIELD_LIMIT { sum - FIELD_LIMIT } else { sum };
+            let idx = if sum >= FIELD_LIMIT {
+                sum - FIELD_LIMIT
+            } else {
+                sum
+            };
             t.antilog[idx as usize]
         };
         output[2 * k] ^= product as u8;
@@ -124,7 +135,10 @@ fn generate_input_bases(count: usize) -> Vec<u16> {
         if logbase >= FIELD_LIMIT {
             // PAR2 caps input blocks at 32768 — long before this branch could fire
             // we'd already have hit `Par2Error::TooManyFiles` upstream.
-            panic!("exhausted GF(2^16) bases coprime to {} (asked for {})", FIELD_LIMIT, count);
+            panic!(
+                "exhausted GF(2^16) bases coprime to {} (asked for {})",
+                FIELD_LIMIT, count
+            );
         }
         if gcd(FIELD_LIMIT, logbase) == 1 {
             bases.push(t.antilog[logbase as usize]);
@@ -135,7 +149,11 @@ fn generate_input_bases(count: usize) -> Vec<u16> {
 }
 
 fn gcd(a: u32, b: u32) -> u32 {
-    if b == 0 { a } else { gcd(b, a % b) }
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
 }
 
 #[cfg(test)]
@@ -174,7 +192,10 @@ mod tests {
         let bases = generate_input_bases(20);
         let bases_as_logs: Vec<u16> = bases.iter().map(|b| t.log[*b as usize]).collect();
         for skip in [0u16, 3, 5, 6, 9, 10, 15, 17] {
-            assert!(!bases_as_logs.contains(&skip), "logbase {skip} should be skipped");
+            assert!(
+                !bases_as_logs.contains(&skip),
+                "logbase {skip} should be skipped"
+            );
         }
     }
 

@@ -11,7 +11,7 @@ use par2rust::{run_create, CreateOptions, Par2Error, SourceFile, MAX_RECOVERY_BL
     version,
     about = "Rust port of par2cmdline (create only).",
     long_about = "par2rust generates PAR2 recovery files. Output is byte-compatible \
-                  with par2cmdline's PAR 2.0 format.",
+                  with par2cmdline's PAR 2.0 format."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -78,7 +78,11 @@ fn run_create_cli(args: CreateArgs) -> Result<(), Par2Error> {
         &sources,
     )?;
 
-    println!("Wrote {} file{}:", written.len(), if written.len() == 1 { "" } else { "s" });
+    println!(
+        "Wrote {} file{}:",
+        written.len(),
+        if written.len() == 1 { "" } else { "s" }
+    );
     for p in &written {
         let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
         println!("  {} ({} bytes)", p.display(), size);

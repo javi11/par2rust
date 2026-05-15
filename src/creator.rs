@@ -52,8 +52,10 @@ pub fn run_create(opts: &CreateOptions, sources: &[SourceFile]) -> Result<Vec<Pa
     }
 
     let file_ids: Vec<Md5Hash> = sources.iter().map(|s| s.file_id).collect();
-    let MainPacket { bytes: main_bytes, set_id_hash } =
-        build_main_packet(opts.slice_size, &file_ids);
+    let MainPacket {
+        bytes: main_bytes,
+        set_id_hash,
+    } = build_main_packet(opts.slice_size, &file_ids);
 
     let mut critical_packets: Vec<u8> = Vec::new();
     critical_packets.extend_from_slice(&main_bytes);
@@ -68,8 +70,7 @@ pub fn run_create(opts: &CreateOptions, sources: &[SourceFile]) -> Result<Vec<Pa
     let mut written = vec![opts.output.clone()];
 
     if opts.recovery_block_count > 0 {
-        let vol_path =
-            derive_volume_filename(&opts.output, 0, opts.recovery_block_count);
+        let vol_path = derive_volume_filename(&opts.output, 0, opts.recovery_block_count);
         let vol_bytes = build_volume_file(
             &set_id_hash,
             &critical_packets,
@@ -94,7 +95,10 @@ pub fn write_index_file(opts: &CreateOptions, sources: &[SourceFile]) -> Result<
         recovery_block_count: 0,
     };
     let files = run_create(&no_recovery, sources)?;
-    Ok(files.into_iter().next().expect("run_create returns at least the index file"))
+    Ok(files
+        .into_iter()
+        .next()
+        .expect("run_create returns at least the index file"))
 }
 
 /// Produce the bytes for a `.vol*.par2` file: critical packets, then the
@@ -123,7 +127,11 @@ fn build_volume_file(
     }
 
     // 2. Initialise RS encoder + dispatch path.
-    let rs = RsEncoder::new(input_blocks.len() as u32, first_exponent, recovery_block_count);
+    let rs = RsEncoder::new(
+        input_blocks.len() as u32,
+        first_exponent,
+        recovery_block_count,
+    );
     let dispatch = detect_dispatch();
 
     // 3. Allocate one zeroed buffer per recovery block. Total memory:
@@ -169,9 +177,9 @@ fn build_volume_file(
     // 5. Build recovery packets in exponent order.
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(critical_packets);
-    for r_idx in 0..recovery_count {
+    for (r_idx, buf) in recovery_buffers.iter().enumerate() {
         let exp = rs.recovery_exponents[r_idx];
-        let pkt = build_recovery_packet(set_id_hash, exp, &recovery_buffers[r_idx]);
+        let pkt = build_recovery_packet(set_id_hash, exp, buf);
         out.extend_from_slice(&pkt);
     }
     out.extend_from_slice(critical_packets);
@@ -246,7 +254,11 @@ mod tests {
         let out = dir.path().join("recovery.par2");
 
         let files = run_create(
-            &CreateOptions { output: out.clone(), slice_size: 4, recovery_block_count: 0 },
+            &CreateOptions {
+                output: out.clone(),
+                slice_size: 4,
+                recovery_block_count: 0,
+            },
             &[src],
         )
         .unwrap();
@@ -262,7 +274,11 @@ mod tests {
         let vol_expected = dir.path().join("recovery.vol0+2.par2");
 
         let files = run_create(
-            &CreateOptions { output: out.clone(), slice_size: 4, recovery_block_count: 2 },
+            &CreateOptions {
+                output: out.clone(),
+                slice_size: 4,
+                recovery_block_count: 2,
+            },
             &[src],
         )
         .unwrap();
@@ -278,7 +294,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let out = dir.path().join("r.par2");
         let err = run_create(
-            &CreateOptions { output: out, slice_size: 4, recovery_block_count: 0 },
+            &CreateOptions {
+                output: out,
+                slice_size: 4,
+                recovery_block_count: 0,
+            },
             &[],
         )
         .unwrap_err();
@@ -308,7 +328,11 @@ mod tests {
         let src = make_source(dir.path(), "a.bin", b"hello par2", 4);
         let out = dir.path().join("recovery.par2");
         let returned = write_index_file(
-            &CreateOptions { output: out.clone(), slice_size: 4, recovery_block_count: 0 },
+            &CreateOptions {
+                output: out.clone(),
+                slice_size: 4,
+                recovery_block_count: 0,
+            },
             &[src],
         )
         .unwrap();

@@ -60,7 +60,11 @@ pub fn gf_mul(a: u16, b: u16) -> u16 {
     }
     let t = gf16_tables();
     let sum = t.log[a as usize] as u32 + t.log[b as usize] as u32;
-    let idx = if sum >= FIELD_LIMIT { sum - FIELD_LIMIT } else { sum };
+    let idx = if sum >= FIELD_LIMIT {
+        sum - FIELD_LIMIT
+    } else {
+        sum
+    };
     t.antilog[idx as usize]
 }
 

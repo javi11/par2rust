@@ -19,6 +19,23 @@ fn par2_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("par2"))
 }
 
+/// Probe the configured `par2` binary by running `par2 -V`. Returns `Ok(())`
+/// if the binary exists and responds; otherwise the test should treat this as
+/// an environment failure (not a code failure) and skip itself.
+fn ensure_par2_available_or_skip(test_name: &str) -> bool {
+    match Command::new(par2_bin()).arg("-V").output() {
+        Ok(out) if out.status.success() => true,
+        Ok(_) | Err(_) => {
+            eprintln!(
+                "[{test_name}] skipping: upstream par2 binary not found \
+                 (set PAR2_BIN or install par2cmdline). On Linux: `apt install par2`, \
+                 macOS: `brew install par2`, Windows: `choco install par2cmdline`.",
+            );
+            false
+        }
+    }
+}
+
 fn write_fixture(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
     let p = dir.join(name);
     let mut f = std::fs::File::create(&p).unwrap();
@@ -32,7 +49,9 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push((state >> 33) as u8);
     }
     out
@@ -66,6 +85,9 @@ fn run_par2_repair(dir: &Path, archive: &Path) -> (std::process::ExitStatus, Str
 
 #[test]
 fn index_only_par2_is_recognised_by_upstream() {
+    if !ensure_par2_available_or_skip("index_only_par2_is_recognised_by_upstream") {
+        return;
+    }
     let dir = tempdir().unwrap();
     let data = deterministic_bytes(1, 32 * 1024);
     write_fixture(dir.path(), "hello.bin", &data);
@@ -74,7 +96,11 @@ fn index_only_par2_is_recognised_by_upstream() {
     let archive = dir.path().join("recovery.par2");
 
     write_index_file(
-        &CreateOptions { output: archive.clone(), slice_size: 4096, recovery_block_count: 0 },
+        &CreateOptions {
+            output: archive.clone(),
+            slice_size: 4096,
+            recovery_block_count: 0,
+        },
         &[src],
     )
     .unwrap();
@@ -96,6 +122,9 @@ fn index_only_par2_is_recognised_by_upstream() {
 
 #[test]
 fn index_with_multiple_files_is_recognised_by_upstream() {
+    if !ensure_par2_available_or_skip("index_with_multiple_files_is_recognised_by_upstream") {
+        return;
+    }
     let dir = tempdir().unwrap();
     write_fixture(dir.path(), "a.bin", &deterministic_bytes(11, 12_000));
     write_fixture(dir.path(), "b.bin", &deterministic_bytes(22, 5_555));
@@ -110,7 +139,11 @@ fn index_with_multiple_files_is_recognised_by_upstream() {
 
     let archive = dir.path().join("set.par2");
     write_index_file(
-        &CreateOptions { output: archive.clone(), slice_size: 4096, recovery_block_count: 0 },
+        &CreateOptions {
+            output: archive.clone(),
+            slice_size: 4096,
+            recovery_block_count: 0,
+        },
         &srcs,
     )
     .unwrap();
@@ -124,7 +157,10 @@ fn index_with_multiple_files_is_recognised_by_upstream() {
          stderr:\n{stderr}",
     );
     for name in ["a.bin", "b.bin", "c.bin"] {
-        assert!(stdout.contains(name), "missing {name} in par2 v output:\n{stdout}");
+        assert!(
+            stdout.contains(name),
+            "missing {name} in par2 v output:\n{stdout}"
+        );
     }
 }
 
@@ -133,6 +169,9 @@ fn index_with_multiple_files_is_recognised_by_upstream() {
 /// data file. Proves the CLI wiring works on a real path.
 #[test]
 fn cli_create_then_upstream_repair() {
+    if !ensure_par2_available_or_skip("cli_create_then_upstream_repair") {
+        return;
+    }
     let dir = tempdir().unwrap();
     let original = deterministic_bytes(0xBA5EBA11, 32 * 1024);
     write_fixture(dir.path(), "doc.bin", &original);
@@ -174,6 +213,9 @@ fn cli_create_then_upstream_repair() {
 /// and the volume-file framing are correct.
 #[test]
 fn corruption_repair_round_trip_against_upstream() {
+    if !ensure_par2_available_or_skip("corruption_repair_round_trip_against_upstream") {
+        return;
+    }
     let dir = tempdir().unwrap();
     let original = deterministic_bytes(0xC0FFEE, 64 * 1024);
     write_fixture(dir.path(), "payload.bin", &original);
@@ -213,7 +255,10 @@ fn corruption_repair_round_trip_against_upstream() {
         *b ^= 0xFF;
     }
     std::fs::write(&payload_path, &bytes).unwrap();
-    assert_ne!(bytes, original, "corruption did not actually change the file");
+    assert_ne!(
+        bytes, original,
+        "corruption did not actually change the file"
+    );
 
     // Upstream attempts repair using our recovery set.
     let (status, stdout, stderr) = run_par2_repair(dir.path(), &archive);
@@ -236,6 +281,9 @@ fn corruption_repair_round_trip_against_upstream() {
 /// upstream repair using recovery slices that span all three.
 #[test]
 fn multi_file_corruption_repair_round_trip() {
+    if !ensure_par2_available_or_skip("multi_file_corruption_repair_round_trip") {
+        return;
+    }
     let dir = tempdir().unwrap();
     let a = deterministic_bytes(1, 8 * 1024);
     let b = deterministic_bytes(2, 12 * 1024);
