@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use par2rust::{run_create, write_index_file, CreateOptions, SourceFile};
+use par2rust::{run_create, write_index_file, CreateOptions, SourceFile, VolumeScheme};
 use tempfile::tempdir;
 
 fn par2_bin() -> PathBuf {
@@ -100,6 +100,7 @@ fn index_only_par2_is_recognised_by_upstream() {
             output: archive.clone(),
             slice_size: 4096,
             recovery_block_count: 0,
+            volume_scheme: VolumeScheme::Single,
         },
         &[src],
     )
@@ -143,6 +144,7 @@ fn index_with_multiple_files_is_recognised_by_upstream() {
             output: archive.clone(),
             slice_size: 4096,
             recovery_block_count: 0,
+            volume_scheme: VolumeScheme::Single,
         },
         &srcs,
     )
@@ -233,6 +235,7 @@ fn corruption_repair_round_trip_against_upstream() {
             output: archive.clone(),
             slice_size: 4096,
             recovery_block_count: 4,
+            volume_scheme: VolumeScheme::Single,
         },
         &[src],
     )
@@ -305,6 +308,7 @@ fn multi_file_corruption_repair_round_trip() {
             output: archive.clone(),
             slice_size: 4096,
             recovery_block_count: 5,
+            volume_scheme: VolumeScheme::Single,
         },
         &srcs,
     )
@@ -327,4 +331,88 @@ fn multi_file_corruption_repair_round_trip() {
     // The intact files must remain untouched.
     assert_eq!(std::fs::read(dir.path().join("a.bin")).unwrap(), a);
     assert_eq!(std::fs::read(dir.path().join("c.bin")).unwrap(), c);
+}
+
+/// Multi-volume distribution: produce a recovery set using the par2cmdline
+/// exponential split, then verify upstream accepts both verify and repair.
+/// Proves recovery exponents are assigned correctly across volumes with a
+/// non-zero `first_exponent`.
+#[test]
+fn exponential_volume_split_verifies_and_repairs() {
+    if !ensure_par2_available_or_skip("exponential_volume_split_verifies_and_repairs") {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let original = deterministic_bytes(0xDEAD_BEEF, 64 * 1024);
+    write_fixture(dir.path(), "payload.bin", &original);
+
+    let src = SourceFile::scan(
+        &dir.path().join("payload.bin"),
+        b"payload.bin".to_vec(),
+        4096,
+    )
+    .unwrap();
+
+    let archive = dir.path().join("recovery.par2");
+    let files = run_create(
+        &CreateOptions {
+            output: archive.clone(),
+            slice_size: 4096,
+            recovery_block_count: 10,
+            volume_scheme: VolumeScheme::Exponential,
+        },
+        &[src],
+    )
+    .unwrap();
+    // Expected layout: index + 5 volume files (1, 1, 2, 4, 2).
+    assert_eq!(
+        files.len(),
+        6,
+        "expected 1 index + 5 volume files, got {files:?}"
+    );
+    let names: Vec<String> = files
+        .iter()
+        .skip(1)
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "recovery.vol0+1.par2",
+            "recovery.vol1+1.par2",
+            "recovery.vol2+2.par2",
+            "recovery.vol4+4.par2",
+            "recovery.vol8+2.par2",
+        ]
+    );
+
+    // Upstream verifies the pristine pair.
+    let (status, stdout, stderr) = run_par2_verify(dir.path(), &archive);
+    assert!(
+        status.success(),
+        "upstream rejected our multi-volume recovery set\n\
+         stdout:\n{stdout}\n\
+         stderr:\n{stderr}",
+    );
+
+    // Corrupt one slice. Recovery budget = 10, well above what we need.
+    let payload_path = dir.path().join("payload.bin");
+    let mut bytes = std::fs::read(&payload_path).unwrap();
+    for b in &mut bytes[8192..8192 + 400] {
+        *b ^= 0xA5;
+    }
+    std::fs::write(&payload_path, &bytes).unwrap();
+
+    let (status, stdout, stderr) = run_par2_repair(dir.path(), &archive);
+    assert!(
+        status.success(),
+        "upstream repair failed using multi-volume recovery set\n\
+         stdout:\n{stdout}\n\
+         stderr:\n{stderr}",
+    );
+    assert_eq!(
+        std::fs::read(&payload_path).unwrap(),
+        original,
+        "repair returned wrong bytes — recovery exponents across volumes are incorrect",
+    );
 }

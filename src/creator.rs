@@ -2,6 +2,9 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use std::ffi::OsString;
+
 use crate::error::{Par2Error, Result};
 use crate::format::Md5Hash;
 use crate::galois_simd::{detect_dispatch, gf_mul_xor_dispatch, Dispatch};
@@ -18,6 +21,22 @@ pub const MAX_FILES: usize = 32_768;
 /// Maximum number of recovery blocks per PAR2 set (16-bit exponent space).
 pub const MAX_RECOVERY_BLOCKS: u32 = 65_535;
 
+/// How to distribute recovery blocks across `.vol*+*.par2` files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum VolumeScheme {
+    /// All recovery blocks go into a single `vol0+N.par2` file.
+    #[default]
+    Single,
+    /// par2cmdline's default scheme: powers-of-two block counts per volume
+    /// (`1, 1, 2, 4, 8, 16, …`), with the final volume holding any remainder
+    /// so the sum equals the total recovery block count.
+    Exponential,
+    /// Caller-supplied volume sizes. The sum must equal
+    /// `recovery_block_count`; otherwise [`run_create`] returns
+    /// [`Par2Error::InvalidVolumeScheme`].
+    Explicit(Vec<u32>),
+}
+
 /// Configuration for one create run.
 pub struct CreateOptions {
     /// Output path for the index file. Volume files derive their names from
@@ -28,6 +47,22 @@ pub struct CreateOptions {
     /// Number of recovery blocks to produce. 0 → no volume file is written
     /// (Phase 3 milestone: index-only output).
     pub recovery_block_count: u32,
+    /// How to split recovery blocks across volume files. Defaults to
+    /// [`VolumeScheme::Single`] for backwards compatibility with earlier
+    /// callers; the CLI overrides this with [`VolumeScheme::Exponential`] to
+    /// match `par2cmdline`'s default behaviour.
+    pub volume_scheme: VolumeScheme,
+}
+
+impl Default for CreateOptions {
+    fn default() -> Self {
+        Self {
+            output: PathBuf::new(),
+            slice_size: 4096,
+            recovery_block_count: 0,
+            volume_scheme: VolumeScheme::Single,
+        }
+    }
 }
 
 /// Run the full create pipeline:
@@ -70,20 +105,82 @@ pub fn run_create(opts: &CreateOptions, sources: &[SourceFile]) -> Result<Vec<Pa
     let mut written = vec![opts.output.clone()];
 
     if opts.recovery_block_count > 0 {
-        let vol_path = derive_volume_filename(&opts.output, 0, opts.recovery_block_count);
-        let vol_bytes = build_volume_file(
-            &set_id_hash,
-            &critical_packets,
-            sources,
-            opts.slice_size,
-            0,
-            opts.recovery_block_count,
-        )?;
-        write_atomic(&vol_path, &vol_bytes)?;
-        written.push(vol_path);
+        let sizes = resolve_volume_sizes(&opts.volume_scheme, opts.recovery_block_count)?;
+        let mut first_exp: u32 = 0;
+        for count in sizes {
+            // first_exp + count <= recovery_block_count <= 65535, so the u16
+            // cast is always safe — we validated the total against
+            // MAX_RECOVERY_BLOCKS above.
+            let first_exp_u16: u16 = first_exp
+                .try_into()
+                .expect("first_exp fits in u16 because total <= MAX_RECOVERY_BLOCKS");
+            let vol_path = derive_volume_filename(&opts.output, first_exp_u16, count);
+            let vol_bytes = build_volume_file(
+                &set_id_hash,
+                &critical_packets,
+                sources,
+                opts.slice_size,
+                first_exp_u16,
+                count,
+            )?;
+            write_atomic(&vol_path, &vol_bytes)?;
+            written.push(vol_path);
+            first_exp += count;
+        }
     }
 
     Ok(written)
+}
+
+/// Materialise a [`VolumeScheme`] into a concrete list of per-volume block
+/// counts. The sum is guaranteed to equal `total` on success.
+fn resolve_volume_sizes(scheme: &VolumeScheme, total: u32) -> Result<Vec<u32>> {
+    match scheme {
+        VolumeScheme::Single => Ok(vec![total]),
+        VolumeScheme::Exponential => Ok(exponential_split(total)),
+        VolumeScheme::Explicit(sizes) => {
+            if sizes.is_empty() {
+                return Err(Par2Error::InvalidVolumeScheme(
+                    "explicit scheme requires at least one volume".into(),
+                ));
+            }
+            if sizes.contains(&0) {
+                return Err(Par2Error::InvalidVolumeScheme(
+                    "explicit scheme volumes must each have >0 recovery blocks".into(),
+                ));
+            }
+            let sum: u64 = sizes.iter().map(|&n| n as u64).sum();
+            if sum != total as u64 {
+                return Err(Par2Error::InvalidVolumeScheme(format!(
+                    "explicit volume sizes sum to {sum}, expected {total}"
+                )));
+            }
+            Ok(sizes.clone())
+        }
+    }
+}
+
+/// par2cmdline-style exponential distribution: 1, 1, 2, 4, 8, 16, …, with the
+/// final volume holding any remainder so the sum equals `total`. Returns an
+/// empty vector when `total == 0` (caller should already have early-returned).
+fn exponential_split(total: u32) -> Vec<u32> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let mut sizes = Vec::new();
+    let mut remaining = total;
+    let mut next: u32 = 1;
+    while remaining > 0 {
+        let take = next.min(remaining);
+        sizes.push(take);
+        remaining -= take;
+        // After the first two volumes, double the capacity each step:
+        // produces the canonical 1, 1, 2, 4, 8, 16, … sequence.
+        if sizes.len() >= 2 {
+            next = next.saturating_mul(2);
+        }
+    }
+    sizes
 }
 
 /// Legacy entrypoint kept so Phase-3-era tests still build. Writes the index
@@ -93,6 +190,7 @@ pub fn write_index_file(opts: &CreateOptions, sources: &[SourceFile]) -> Result<
         output: opts.output.clone(),
         slice_size: opts.slice_size,
         recovery_block_count: 0,
+        volume_scheme: VolumeScheme::Single,
     };
     let files = run_create(&no_recovery, sources)?;
     Ok(files
@@ -150,7 +248,7 @@ fn build_volume_file(
         let reader = match &mut current_file {
             Some((idx, r)) if *idx == *file_idx => r,
             _ => {
-                let f = File::open(&sources[*file_idx].path)?;
+                let f = File::open(to_long_path(&sources[*file_idx].path))?;
                 current_file = Some((*file_idx, BufReader::with_capacity(1 << 16, f)));
                 let (_, r) = current_file.as_mut().unwrap();
                 r
@@ -217,7 +315,8 @@ fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> 
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut tmp = path.to_path_buf();
+    let path = to_long_path(path);
+    let mut tmp = path.clone();
     let mut name = tmp
         .file_name()
         .map(|n| n.to_os_string())
@@ -230,8 +329,38 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+/// On Windows, prefix output paths with `\\?\` so the Win32 layer skips its
+/// 260-character `MAX_PATH` check. The Rust stdlib already calls the wide-char
+/// APIs (`CreateFileW`, etc.) under the hood, so this is the only piece of
+/// Windows path handling par2rust needs.
+///
+/// On non-Windows platforms this is a no-op pass-through.
+#[cfg(windows)]
+fn to_long_path(path: &Path) -> PathBuf {
+    let s = path.as_os_str();
+    let bytes = s.as_encoded_bytes();
+    // Already a verbatim or device path — leave it alone.
+    if bytes.starts_with(br"\\?\") || bytes.starts_with(br"\\.\") {
+        return path.to_path_buf();
+    }
+    // Resolve to an absolute path so the prefix is meaningful. We can't use
+    // std::fs::canonicalize here because the output file doesn't exist yet.
+    let abs = match std::env::current_dir() {
+        Ok(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    };
+    let mut prefixed = OsString::from(r"\\?\");
+    prefixed.push(abs.as_os_str());
+    PathBuf::from(prefixed)
+}
+
+#[cfg(not(windows))]
+fn to_long_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 #[cfg(test)]
@@ -258,6 +387,7 @@ mod tests {
                 output: out.clone(),
                 slice_size: 4,
                 recovery_block_count: 0,
+                volume_scheme: VolumeScheme::Single,
             },
             &[src],
         )
@@ -278,6 +408,7 @@ mod tests {
                 output: out.clone(),
                 slice_size: 4,
                 recovery_block_count: 2,
+                volume_scheme: VolumeScheme::Single,
             },
             &[src],
         )
@@ -298,6 +429,7 @@ mod tests {
                 output: out,
                 slice_size: 4,
                 recovery_block_count: 0,
+                volume_scheme: VolumeScheme::Single,
             },
             &[],
         )
@@ -315,6 +447,7 @@ mod tests {
                 output: out,
                 slice_size: 4,
                 recovery_block_count: MAX_RECOVERY_BLOCKS + 1,
+                volume_scheme: VolumeScheme::Single,
             },
             &[src],
         )
@@ -332,11 +465,186 @@ mod tests {
                 output: out.clone(),
                 slice_size: 4,
                 recovery_block_count: 0,
+                volume_scheme: VolumeScheme::Single,
             },
             &[src],
         )
         .unwrap();
         assert_eq!(returned, out);
         assert!(out.exists());
+    }
+
+    // ---------------------------------------------------------------
+    // Multi-volume distribution
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn exponential_split_total_one_is_single_volume() {
+        assert_eq!(exponential_split(1), vec![1]);
+    }
+
+    #[test]
+    fn exponential_split_total_two_is_two_volumes_of_one() {
+        assert_eq!(exponential_split(2), vec![1, 1]);
+    }
+
+    #[test]
+    fn exponential_split_total_four_doubles_after_pair() {
+        assert_eq!(exponential_split(4), vec![1, 1, 2]);
+    }
+
+    #[test]
+    fn exponential_split_total_ten_remainder_clamps() {
+        // 1 + 1 + 2 + 4 = 8, remaining 2 → final volume = 2.
+        assert_eq!(exponential_split(10), vec![1, 1, 2, 4, 2]);
+    }
+
+    #[test]
+    fn exponential_split_sums_to_total_for_many_sizes() {
+        for total in [1u32, 2, 3, 7, 50, 100, 1000, 65_535] {
+            let sizes = exponential_split(total);
+            let sum: u64 = sizes.iter().map(|&n| n as u64).sum();
+            assert_eq!(sum, total as u64, "scheme didn't sum to {total}: {sizes:?}");
+            assert!(
+                sizes.iter().all(|&n| n > 0),
+                "scheme produced zero-sized volume: {sizes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exponential_scheme_produces_expected_volume_files() {
+        let dir = tempdir().unwrap();
+        // 4096-byte slices; payload fills enough slices for 10 recovery blocks
+        // to be meaningful. The actual block math doesn't matter for the
+        // filename-layout assertion below.
+        let payload = vec![0xABu8; 4096 * 4];
+        let src = make_source(dir.path(), "a.bin", &payload, 4096);
+        let out = dir.path().join("recovery.par2");
+
+        let files = run_create(
+            &CreateOptions {
+                output: out.clone(),
+                slice_size: 4096,
+                recovery_block_count: 10,
+                volume_scheme: VolumeScheme::Exponential,
+            },
+            &[src],
+        )
+        .unwrap();
+
+        // index + 5 volume files (1+1+2+4+2).
+        let names: Vec<String> = files
+            .iter()
+            .skip(1) // drop the index
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "recovery.vol0+1.par2",
+                "recovery.vol1+1.par2",
+                "recovery.vol2+2.par2",
+                "recovery.vol4+4.par2",
+                "recovery.vol8+2.par2",
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_scheme_rejects_sum_mismatch() {
+        let dir = tempdir().unwrap();
+        let src = make_source(dir.path(), "a.bin", b"hello par2 world!!!!", 4);
+        let out = dir.path().join("recovery.par2");
+        let err = run_create(
+            &CreateOptions {
+                output: out,
+                slice_size: 4,
+                recovery_block_count: 5,
+                volume_scheme: VolumeScheme::Explicit(vec![2, 2]),
+            },
+            &[src],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Par2Error::InvalidVolumeScheme(_)),
+            "expected InvalidVolumeScheme, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_scheme_rejects_zero_sized_volume() {
+        let dir = tempdir().unwrap();
+        let src = make_source(dir.path(), "a.bin", b"hello par2 world!!!!", 4);
+        let out = dir.path().join("recovery.par2");
+        let err = run_create(
+            &CreateOptions {
+                output: out,
+                slice_size: 4,
+                recovery_block_count: 4,
+                volume_scheme: VolumeScheme::Explicit(vec![2, 0, 2]),
+            },
+            &[src],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Par2Error::InvalidVolumeScheme(_)));
+    }
+
+    #[test]
+    fn explicit_scheme_honours_caller_layout() {
+        let dir = tempdir().unwrap();
+        let payload = vec![0x5Au8; 4096 * 3];
+        let src = make_source(dir.path(), "a.bin", &payload, 4096);
+        let out = dir.path().join("recovery.par2");
+
+        let files = run_create(
+            &CreateOptions {
+                output: out.clone(),
+                slice_size: 4096,
+                recovery_block_count: 6,
+                volume_scheme: VolumeScheme::Explicit(vec![3, 3]),
+            },
+            &[src],
+        )
+        .unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .skip(1)
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["recovery.vol0+3.par2", "recovery.vol3+3.par2"]);
+    }
+
+    #[test]
+    fn create_options_default_is_single_scheme() {
+        let opts = CreateOptions::default();
+        assert_eq!(opts.volume_scheme, VolumeScheme::Single);
+    }
+
+    // ---------------------------------------------------------------
+    // Long-path helper
+    // ---------------------------------------------------------------
+
+    #[cfg(not(windows))]
+    #[test]
+    fn to_long_path_is_passthrough_on_unix() {
+        let p = Path::new("/tmp/a.bin");
+        assert_eq!(to_long_path(p), PathBuf::from("/tmp/a.bin"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn to_long_path_leaves_verbatim_paths_alone() {
+        let p = Path::new(r"\\?\C:\foo\bar");
+        assert_eq!(to_long_path(p), PathBuf::from(r"\\?\C:\foo\bar"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn to_long_path_prefixes_plain_absolute_path() {
+        let p = Path::new(r"C:\some\dir\file.par2");
+        let out = to_long_path(p);
+        let s = out.to_string_lossy();
+        assert!(s.starts_with(r"\\?\"), "expected \\\\?\\ prefix, got {s}");
     }
 }

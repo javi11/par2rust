@@ -25,6 +25,9 @@ pub enum Par2Error {
 
     #[error("recovery block count {0} exceeds PAR2 limit of 65535")]
     TooManyRecoveryBlocks(u32),
+
+    #[error("invalid volume scheme: {0}")]
+    InvalidVolumeScheme(String),
 }
 
 pub type Result<T> = std::result::Result<T, Par2Error>;

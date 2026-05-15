@@ -23,6 +23,7 @@ fn main() -> par2rust::Result<()> {
             output: output.clone(),
             slice_size: 4096,
             recovery_block_count: 10,
+            ..Default::default()
         },
         &[source],
     )?;
