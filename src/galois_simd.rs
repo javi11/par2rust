@@ -323,9 +323,11 @@ mod x86 {
         // Permutation mask to deinterleave 32 bytes (interleaved low/high of
         // 16 symbols) into two 16-byte vectors of low bytes and high bytes.
         // SSSE3 has no `pshufb` across two registers, so we do two loads and
-        // shuffle each, then combine.
-        let lo_idx = _mm_set_epi8(14, 12, 10, 8, 6, 4, 2, 0, -1, -1, -1, -1, -1, -1, -1, -1);
-        let hi_idx = _mm_set_epi8(15, 13, 11, 9, 7, 5, 3, 1, -1, -1, -1, -1, -1, -1, -1, -1);
+        // shuffle each, then combine. `_mm_set_epi8` writes its first argument
+        // to the highest-indexed lane, so the meaningful indices must sit in
+        // the low half here for `_mm_unpacklo_epi64` (below) to pick them up.
+        let lo_idx = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
+        let hi_idx = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
 
         let chunks = input.len() / 32;
         let mut consumed = 0usize;
