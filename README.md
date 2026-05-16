@@ -139,20 +139,22 @@ Public API surface:
 worker thread to keep scheduling overhead negligible). Pass `-t/--threads N` to
 pin the worker count; `0` (default) uses one per logical CPU.
 
-Benchmark — Apple M4, 10 cores, macOS 25.3, 16 GB RAM. Workload: a 513 MB MKV
-file with `-s 524288 -c 200` (~10% redundancy, multi-volume exponential split).
-Best of 3 runs:
+Benchmark — Apple M4, 10 cores, macOS 25.3, 16 GB RAM. Workload: a 513 MiB
+(538,218,411-byte) MKV file with `-s 524288 -c 200` (~10% redundancy,
+multi-volume exponential split). Max RSS via `/usr/bin/time -l`. Best of 3
+runs:
 
-| Tool                             | Wall   | User CPU | Notes                            |
-|----------------------------------|-------:|---------:|----------------------------------|
-| `par2rust create` (default, 10 threads) | **4.55 s** | 13.50 s  | this crate                       |
-| `par2cmdline 1.1.1` (OpenMP)     | 6.18 s | 25.03 s  | upstream reference               |
-| `par2rust create -t 1`           | 7.16 s | 6.49 s   | single-threaded baseline         |
+| Tool                             | Wall   | User CPU | Max RSS  | Notes                    |
+|----------------------------------|-------:|---------:|---------:|--------------------------|
+| `par2rust create` (default, 10 threads) | **5.52 s** | 16.02 s | 122 MB | this crate              |
+| `par2cmdline 1.1.1` (OpenMP)     | 7.78 s | 28.39 s  | 104 MB   | upstream reference       |
+| `par2rust create -t 1`           | 7.38 s | 6.73 s   | 137 MB   | single-threaded baseline |
 
-Result on this hardware: **~26% faster wall-clock than par2cmdline** while using
-**~46% less CPU time** (≈3.9× more cycle-efficient per unit of wall time). The
-single-threaded mode still beats par2cmdline's *per-core* throughput by ~3.5×
-thanks to the NEON GF(2¹⁶) multiplier.
+Result on this hardware: **~29% faster wall-clock than par2cmdline** while
+using **~44% less CPU time** (≈2.6× more cycle-efficient per unit of wall
+time) for ~17% more resident memory. The single-threaded mode still beats
+par2cmdline's *per-core* throughput by ~4.2× thanks to the NEON GF(2¹⁶)
+multiplier.
 
 Scaling on this workload plateaus around 4 threads — at 200 × 524 KB recovery
 buffers (≈105 MB live) the inner loop becomes memory-bandwidth-bound rather
