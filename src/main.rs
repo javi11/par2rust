@@ -43,6 +43,23 @@ struct CreateArgs {
     #[arg(long = "single-volume", default_value_t = false)]
     single_volume: bool,
 
+    /// par2cmdline `-u`: distribute recovery blocks uniformly across volume
+    /// files instead of exponential growth. Combine with `-n` to set the
+    /// volume count explicitly (defaults to par2cmdline's heuristic).
+    #[arg(short = 'u', long = "uniform", default_value_t = false)]
+    uniform: bool,
+
+    /// par2cmdline `-l`: cap each volume file's size so it does not exceed
+    /// the largest source file. Composes with `-u` and with the default
+    /// exponential layout.
+    #[arg(short = 'l', long = "limit-size", default_value_t = false)]
+    limit_size: bool,
+
+    /// par2cmdline `-n<count>`: explicit number of recovery volume files.
+    /// Currently honoured only when combined with `-u`.
+    #[arg(short = 'n', long = "volume-count")]
+    volume_count: Option<u32>,
+
     /// Number of worker threads. 0 = auto (one per logical CPU).
     #[arg(short = 't', long = "threads", default_value_t = 0)]
     threads: usize,
@@ -90,11 +107,7 @@ fn run_create_cli(args: CreateArgs) -> Result<(), Par2Error> {
         sources.push(src);
     }
 
-    let volume_scheme = if args.single_volume {
-        VolumeScheme::Single
-    } else {
-        VolumeScheme::Exponential
-    };
+    let volume_scheme = build_volume_scheme(&args, &sources)?;
 
     let written = run_create(
         &CreateOptions {
@@ -116,6 +129,63 @@ fn run_create_cli(args: CreateArgs) -> Result<(), Par2Error> {
         println!("  {} ({} bytes)", p.display(), size);
     }
     Ok(())
+}
+
+/// par2cmdline's heuristic for the default number of uniform recovery volumes
+/// when `-u` is passed without `-n`. Upstream caps the count at 15 by default.
+fn default_uniform_count(recovery_count: u32) -> u32 {
+    recovery_count.clamp(1, 15)
+}
+
+/// Assemble a [`VolumeScheme`] from the CLI flags. Mirrors par2cmdline's
+/// flag interactions:
+///   - `--single-volume`: standalone, conflicts with `-u`/`-l`/`-n`.
+///   - `-u` → `Uniform { count }` where `count` is `-n` or the default.
+///   - `-l` → wraps the chosen inner scheme in `Limited` with the cap
+///     derived from the largest source file.
+fn build_volume_scheme(
+    args: &CreateArgs,
+    sources: &[SourceFile],
+) -> Result<VolumeScheme, Par2Error> {
+    if args.single_volume && (args.uniform || args.limit_size || args.volume_count.is_some()) {
+        return Err(Par2Error::InvalidVolumeScheme(
+            "--single-volume cannot be combined with -u, -l, or -n".into(),
+        ));
+    }
+    if args.single_volume {
+        return Ok(VolumeScheme::Single);
+    }
+    if args.volume_count.is_some() && !args.uniform {
+        return Err(Par2Error::InvalidVolumeScheme(
+            "-n/--volume-count currently requires -u/--uniform".into(),
+        ));
+    }
+
+    let inner = if args.uniform {
+        let count = args
+            .volume_count
+            .unwrap_or_else(|| default_uniform_count(args.recovery_count));
+        VolumeScheme::Uniform { count }
+    } else {
+        VolumeScheme::Exponential
+    };
+
+    if !args.limit_size {
+        return Ok(inner);
+    }
+
+    let largest = sources.iter().map(|s| s.length).max().unwrap_or(0);
+    if largest == 0 {
+        return Err(Par2Error::InvalidVolumeScheme(
+            "-l/--limit-size requires at least one non-empty source file".into(),
+        ));
+    }
+    let cap_u64 = largest / args.slice_size;
+    let cap: u32 = cap_u64.max(1).try_into().unwrap_or(u32::MAX);
+    Ok(VolumeScheme::Limited {
+        max_blocks_per_volume: cap,
+        inner: Box::new(inner),
+    })
 }
 
 /// Pick the bytes to record as the filename inside the PAR2 packet. We use the
