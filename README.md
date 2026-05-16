@@ -15,8 +15,8 @@ quickpar, multipar) can verify and repair files using the output.
   - **SSSE3** on `x86_64`
   - Byte-table scalar fallback elsewhere
 - ✅ Windows long-path support (`\\?\` prefix for paths >260 chars)
-- ✅ Golden tests against upstream `par2 v` and `par2 r`
-- ✅ par2cmdline-compatible distribution flags: `-u` (uniform),
+- ✅ Tests against upstream `par2 v` and `par2 r`
+- ✅ Distribution flags: `-u` (uniform),
   `-l` (limit volume size to largest source file), `-n<count>` (volume count)
 - 🚧 **Not implemented**: verify, repair, PAR1 legacy format
 
