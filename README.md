@@ -1,6 +1,6 @@
 # par2rust
 
-A Rust port of the **create** side of [par2cmdline](https://github.com/Parchive/par2cmdline).
+A Rust implementation of par2 file creation.
 Given a set of input files, `par2rust` produces a PAR2 recovery set that is
 byte-compatible with the upstream tool — any standard PAR2 verifier (par2cmdline,
 quickpar, multipar) can verify and repair files using the output.
@@ -144,20 +144,6 @@ Scaling on this workload plateaus around 4 threads — at 200 × 524 KB recovery
 buffers (≈105 MB live) the inner loop becomes memory-bandwidth-bound rather
 than compute-bound. Tune `slice-size` / `recovery-count` to fit your CPU's
 shared cache for best results.
-
-## Architecture
-
-- [`src/format.rs`](src/format.rs) — packet header layout, magic constants, MD5 wrapper
-- [`src/source.rs`](src/source.rs) — input file scanner (slice hashing, file_id derivation)
-- [`src/packet/`](src/packet) — one builder per PAR2 packet type (main, file_desc, file_verify, recovery, creator)
-- [`src/galois.rs`](src/galois.rs) — GF(2¹⁶) log/antilog tables and scalar arithmetic
-- [`src/reedsolomon.rs`](src/reedsolomon.rs) — RS encoder (Vandermonde matrix construction + scalar reference)
-- [`src/galois_simd.rs`](src/galois_simd.rs) — SIMD multiply-XOR paths (NEON, SSSE3, byte-table fallback)
-- [`src/creator.rs`](src/creator.rs) — pipeline that orchestrates the create flow
-- [`src/main.rs`](src/main.rs) — `clap`-based CLI
-
-All SIMD paths are property-tested against the scalar reference for byte-identical
-output across thousands of randomized inputs ([src/galois_simd.rs#tests](src/galois_simd.rs)).
 
 ## Testing
 
