@@ -16,8 +16,9 @@ quickpar, multipar) can verify and repair files using the output.
   - Byte-table scalar fallback elsewhere
 - ✅ Windows long-path support (`\\?\` prefix for paths >260 chars)
 - ✅ Golden tests against upstream `par2 v` and `par2 r`
-- 🚧 **Not implemented**: verify, repair, PAR1 legacy format,
-  par2cmdline's `-u`/`-l` distribution flags (uniform / limit-count)
+- ✅ par2cmdline-compatible distribution flags: `-u` (uniform),
+  `-l` (limit volume size to largest source file), `-n<count>` (volume count)
+- 🚧 **Not implemented**: verify, repair, PAR1 legacy format
 
 ## Install / build
 
@@ -58,6 +59,19 @@ To collapse into a single recovery file (the previous default), pass
 `--single-volume`:
 ```bash
 par2rust create --single-volume -s 262144 -c 50 backup.par2 data.bin
+```
+
+Alternative distributions matching par2cmdline's flags:
+
+```bash
+# -u: uniform — split recovery blocks evenly. -n sets the volume count
+# (defaults to 15, capped at the recovery-block total).
+par2rust c -s 4096 -c 50 -u -n 5 backup.par2 data.bin
+# → 5 volumes of 10 blocks each
+
+# -l: cap each volume's size to the largest source file. Composes with -u
+# and with the default exponential layout.
+par2rust c -s 4096 -c 50 -l backup.par2 data.bin
 ```
 
 Verify and repair with upstream tools:
@@ -115,7 +129,7 @@ Public API surface:
 - `run_create(&CreateOptions, &[SourceFile]) -> Result<Vec<PathBuf>>` — full create pipeline
 - `SourceFile::scan(path, display_name, slice_size)` — hash one input file
 - `CreateOptions { output, slice_size, recovery_block_count, volume_scheme }`
-- `VolumeScheme::{Single, Exponential, Explicit(Vec<u32>)}` — recovery-file split
+- `VolumeScheme::{Single, Exponential, Uniform { count }, Limited { max_blocks_per_volume, inner }, Explicit(Vec<u32>)}` — recovery-file split
 - Errors via `Par2Error` (`thiserror`-derived)
 - Constants: `MAX_FILES`, `MAX_RECOVERY_BLOCKS`
 

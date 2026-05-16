@@ -31,6 +31,21 @@ pub enum VolumeScheme {
     /// (`1, 1, 2, 4, 8, 16, …`), with the final volume holding any remainder
     /// so the sum equals the total recovery block count.
     Exponential,
+    /// par2cmdline `-u` (optionally with `-n<count>`): split the total block
+    /// count across `count` volumes as evenly as possible. The first
+    /// `count - 1` volumes each get `total / count` blocks; the final volume
+    /// absorbs the remainder.
+    Uniform { count: u32 },
+    /// par2cmdline `-l`: cap each volume so its on-disk size does not exceed
+    /// the largest source file. The cap is expressed in recovery blocks
+    /// (`floor(largest_source_size / slice_size)`). The inner scheme decides
+    /// the growth pattern (`Exponential` for plain `-l`, `Uniform` for
+    /// `-u -l`); the resolver splits any over-cap entry into cap-sized
+    /// chunks.
+    Limited {
+        max_blocks_per_volume: u32,
+        inner: Box<VolumeScheme>,
+    },
     /// Caller-supplied volume sizes. The sum must equal
     /// `recovery_block_count`; otherwise [`run_create`] returns
     /// [`Par2Error::InvalidVolumeScheme`].
@@ -138,6 +153,19 @@ fn resolve_volume_sizes(scheme: &VolumeScheme, total: u32) -> Result<Vec<u32>> {
     match scheme {
         VolumeScheme::Single => Ok(vec![total]),
         VolumeScheme::Exponential => Ok(exponential_split(total)),
+        VolumeScheme::Uniform { count } => uniform_split(total, *count),
+        VolumeScheme::Limited {
+            max_blocks_per_volume,
+            inner,
+        } => {
+            if *max_blocks_per_volume == 0 {
+                return Err(Par2Error::InvalidVolumeScheme(
+                    "Limited scheme requires max_blocks_per_volume > 0".into(),
+                ));
+            }
+            let inner_sizes = resolve_volume_sizes(inner, total)?;
+            Ok(cap_volume_sizes(&inner_sizes, *max_blocks_per_volume))
+        }
         VolumeScheme::Explicit(sizes) => {
             if sizes.is_empty() {
                 return Err(Par2Error::InvalidVolumeScheme(
@@ -181,6 +209,52 @@ fn exponential_split(total: u32) -> Vec<u32> {
         }
     }
     sizes
+}
+
+/// par2cmdline `-u` distribution: split `total` blocks across `count` volumes
+/// as evenly as possible. The first `count - 1` volumes each get
+/// `total / count` blocks; the last volume absorbs the remainder.
+fn uniform_split(total: u32, count: u32) -> Result<Vec<u32>> {
+    if count == 0 {
+        return Err(Par2Error::InvalidVolumeScheme(
+            "Uniform scheme requires count > 0".into(),
+        ));
+    }
+    if count > total {
+        return Err(Par2Error::InvalidVolumeScheme(format!(
+            "Uniform scheme count ({count}) exceeds recovery block total ({total})"
+        )));
+    }
+    let base = total / count;
+    let remainder = total - base * count;
+    let mut sizes = Vec::with_capacity(count as usize);
+    for _ in 0..(count - 1) {
+        sizes.push(base);
+    }
+    sizes.push(base + remainder);
+    Ok(sizes)
+}
+
+/// Cap each entry of `sizes` at `cap`. Any over-cap entry is split into
+/// consecutive `cap`-sized volumes plus a trailing remainder. Preserves the
+/// total sum.
+fn cap_volume_sizes(sizes: &[u32], cap: u32) -> Vec<u32> {
+    let mut out = Vec::with_capacity(sizes.len());
+    for &n in sizes {
+        if n <= cap {
+            out.push(n);
+        } else {
+            let mut remaining = n;
+            while remaining > cap {
+                out.push(cap);
+                remaining -= cap;
+            }
+            if remaining > 0 {
+                out.push(remaining);
+            }
+        }
+    }
+    out
 }
 
 /// Legacy entrypoint kept so Phase-3-era tests still build. Writes the index
@@ -640,6 +714,134 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["recovery.vol0+3.par2", "recovery.vol3+3.par2"]);
+    }
+
+    // ---------------------------------------------------------------
+    // Uniform (-u) and Limited (-l) distribution
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn uniform_split_divides_evenly() {
+        assert_eq!(uniform_split(10, 5).unwrap(), vec![2, 2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn uniform_split_dumps_remainder_into_last_volume() {
+        // 13 / 4 = 3 with remainder 1 → 3, 3, 3, 4.
+        assert_eq!(uniform_split(13, 4).unwrap(), vec![3, 3, 3, 4]);
+    }
+
+    #[test]
+    fn uniform_split_count_one_matches_single() {
+        assert_eq!(uniform_split(42, 1).unwrap(), vec![42]);
+    }
+
+    #[test]
+    fn uniform_split_rejects_zero_count() {
+        let err = uniform_split(10, 0).unwrap_err();
+        assert!(matches!(err, Par2Error::InvalidVolumeScheme(_)));
+    }
+
+    #[test]
+    fn uniform_split_rejects_count_greater_than_total() {
+        let err = uniform_split(3, 5).unwrap_err();
+        assert!(matches!(err, Par2Error::InvalidVolumeScheme(_)));
+    }
+
+    #[test]
+    fn uniform_split_sums_to_total_across_sizes() {
+        for (total, count) in [(1u32, 1), (7, 3), (50, 7), (100, 10), (65_535, 17)] {
+            let sizes = uniform_split(total, count).unwrap();
+            assert_eq!(sizes.len() as u32, count);
+            let sum: u64 = sizes.iter().map(|&n| n as u64).sum();
+            assert_eq!(sum, total as u64, "sum mismatch for ({total},{count})");
+        }
+    }
+
+    #[test]
+    fn cap_volume_sizes_leaves_in_bounds_entries_alone() {
+        assert_eq!(cap_volume_sizes(&[1, 2, 3], 4), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn cap_volume_sizes_splits_oversize_entries() {
+        // cap = 3; the 10 splits to 3, 3, 3, 1.
+        assert_eq!(cap_volume_sizes(&[2, 10, 1], 3), vec![2, 3, 3, 3, 1, 1]);
+    }
+
+    #[test]
+    fn cap_volume_sizes_clean_split_no_remainder() {
+        // cap = 4; 8 splits exactly into 4, 4 (no trailing remainder).
+        assert_eq!(cap_volume_sizes(&[8], 4), vec![4, 4]);
+    }
+
+    #[test]
+    fn limited_scheme_caps_exponential_growth() {
+        let scheme = VolumeScheme::Limited {
+            max_blocks_per_volume: 3,
+            inner: Box::new(VolumeScheme::Exponential),
+        };
+        // Exponential(20) = [1, 1, 2, 4, 8, 4]; cap = 3 → [1, 1, 2, 3, 1, 3, 3, 2, 3, 1].
+        let sizes = resolve_volume_sizes(&scheme, 20).unwrap();
+        assert!(sizes.iter().all(|&n| n <= 3 && n > 0));
+        let sum: u32 = sizes.iter().sum();
+        assert_eq!(sum, 20);
+    }
+
+    #[test]
+    fn limited_scheme_caps_uniform_layout() {
+        let scheme = VolumeScheme::Limited {
+            max_blocks_per_volume: 4,
+            inner: Box::new(VolumeScheme::Uniform { count: 2 }),
+        };
+        // Uniform(20, 2) = [10, 10]; cap = 4 → [4, 4, 2, 4, 4, 2].
+        let sizes = resolve_volume_sizes(&scheme, 20).unwrap();
+        assert_eq!(sizes, vec![4, 4, 2, 4, 4, 2]);
+    }
+
+    #[test]
+    fn limited_scheme_rejects_zero_cap() {
+        let scheme = VolumeScheme::Limited {
+            max_blocks_per_volume: 0,
+            inner: Box::new(VolumeScheme::Exponential),
+        };
+        let err = resolve_volume_sizes(&scheme, 10).unwrap_err();
+        assert!(matches!(err, Par2Error::InvalidVolumeScheme(_)));
+    }
+
+    #[test]
+    fn uniform_scheme_produces_expected_volume_files() {
+        let dir = tempdir().unwrap();
+        let payload = vec![0xCDu8; 4096 * 4];
+        let src = make_source(dir.path(), "a.bin", &payload, 4096);
+        let out = dir.path().join("recovery.par2");
+
+        let files = run_create(
+            &CreateOptions {
+                output: out.clone(),
+                slice_size: 4096,
+                recovery_block_count: 10,
+                volume_scheme: VolumeScheme::Uniform { count: 4 },
+            },
+            &[src],
+        )
+        .unwrap();
+
+        // Uniform(10, 4) = [2, 2, 2, 4].
+        let names: Vec<String> = files
+            .iter()
+            .skip(1)
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "recovery.vol0+2.par2",
+                "recovery.vol2+2.par2",
+                "recovery.vol4+2.par2",
+                "recovery.vol6+4.par2",
+            ]
+        );
     }
 
     #[test]
