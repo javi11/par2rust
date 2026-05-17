@@ -13,6 +13,7 @@ use crate::packet::file_desc::build_file_desc_packet;
 use crate::packet::file_verify::build_file_verify_packet;
 use crate::packet::main_packet::{build_main_packet, MainPacket};
 use crate::packet::recovery::build_recovery_packet;
+use crate::progress::{tick_stride, ProgressEvent, ProgressReporter};
 use crate::reedsolomon::RsEncoder;
 use crate::source::SourceFile;
 
@@ -88,6 +89,16 @@ impl Default for CreateOptions {
 ///
 /// Returns the list of all files written, with the index file first.
 pub fn run_create(opts: &CreateOptions, sources: &[SourceFile]) -> Result<Vec<PathBuf>> {
+    run_create_with_progress(opts, sources, None)
+}
+
+/// Like [`run_create`] but emits progress events through `reporter`.
+/// Pass `None` for behaviour identical to `run_create`.
+pub fn run_create_with_progress(
+    opts: &CreateOptions,
+    sources: &[SourceFile],
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<Vec<PathBuf>> {
     if sources.is_empty() {
         return Err(Par2Error::NoInputFiles);
     }
@@ -117,12 +128,17 @@ pub fn run_create(opts: &CreateOptions, sources: &[SourceFile]) -> Result<Vec<Pa
     critical_packets.extend_from_slice(&creator_pkt);
 
     write_atomic(&opts.output, &critical_packets)?;
+    if let Some(r) = reporter {
+        r.on_event(ProgressEvent::IndexWritten { path: &opts.output });
+    }
     let mut written = vec![opts.output.clone()];
 
     if opts.recovery_block_count > 0 {
         let sizes = resolve_volume_sizes(&opts.volume_scheme, opts.recovery_block_count)?;
+        let total_volumes = sizes.len() as u32;
         let mut first_exp: u32 = 0;
-        for count in sizes {
+        for (volume_index, count) in sizes.into_iter().enumerate() {
+            let volume_index = volume_index as u32;
             // first_exp + count <= recovery_block_count <= 65535, so the u16
             // cast is always safe — we validated the total against
             // MAX_RECOVERY_BLOCKS above.
@@ -137,8 +153,14 @@ pub fn run_create(opts: &CreateOptions, sources: &[SourceFile]) -> Result<Vec<Pa
                 opts.slice_size,
                 first_exp_u16,
                 count,
+                volume_index,
+                total_volumes,
+                reporter,
             )?;
             write_atomic(&vol_path, &vol_bytes)?;
+            if let Some(r) = reporter {
+                r.on_event(ProgressEvent::VolumeWritten { path: &vol_path });
+            }
             written.push(vol_path);
             first_exp += count;
         }
@@ -277,6 +299,7 @@ pub fn write_index_file(opts: &CreateOptions, sources: &[SourceFile]) -> Result<
 /// recovery packets in exponent order, then critical packets again (the
 /// upstream convention — improves the chance that the index can be
 /// reconstructed from any single volume file alone).
+#[allow(clippy::too_many_arguments)]
 fn build_volume_file(
     set_id_hash: &Md5Hash,
     critical_packets: &[u8],
@@ -284,6 +307,9 @@ fn build_volume_file(
     slice_size: u64,
     first_exponent: u16,
     recovery_block_count: u32,
+    volume_index: u32,
+    total_volumes: u32,
+    reporter: Option<&dyn ProgressReporter>,
 ) -> Result<Vec<u8>> {
     let slice_size_usize: usize = slice_size
         .try_into()
@@ -297,6 +323,17 @@ fn build_volume_file(
             input_blocks.push((file_idx, slice_idx as u64));
         }
     }
+
+    let input_blocks_total = input_blocks.len() as u64;
+    if let Some(r) = reporter {
+        r.on_event(ProgressEvent::EncodeStarted {
+            volume_index,
+            total_volumes,
+            input_blocks: input_blocks_total,
+            recovery_blocks: recovery_block_count,
+        });
+    }
+    let progress_stride = tick_stride(input_blocks_total);
 
     // 2. Initialise RS encoder + dispatch path.
     let rs = RsEncoder::new(
@@ -361,6 +398,17 @@ fn build_volume_file(
                     gf_mul_xor_dispatch(dispatch, coeff, slice_ref, out);
                 }
             });
+
+        if let Some(r) = reporter {
+            let done = (input_idx as u64) + 1;
+            if done == input_blocks_total || done % progress_stride == 0 {
+                r.on_event(ProgressEvent::EncodeProgress {
+                    volume_index,
+                    input_block_done: done,
+                    input_blocks: input_blocks_total,
+                });
+            }
+        }
     }
     drop(current_file);
 
@@ -376,6 +424,10 @@ fn build_volume_file(
 
     // Sanity: silences `dispatch` going unused on exotic targets.
     let _ = (dispatch, &Dispatch::Scalar);
+
+    if let Some(r) = reporter {
+        r.on_event(ProgressEvent::EncodeCompleted { volume_index });
+    }
 
     Ok(out)
 }
@@ -467,7 +519,55 @@ fn apply_long_path_prefix(path: &Path, cwd: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::{ProgressEvent, ProgressReporter};
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    #[derive(Debug, PartialEq)]
+    enum Phase {
+        ScanStart,
+        ScanProgress(u64, u64),
+        ScanEnd,
+        EncodeStart(u32, u32, u64, u32),
+        EncodeProgress(u32, u64, u64),
+        EncodeEnd(u32),
+        IndexWritten,
+        VolumeWritten,
+    }
+
+    #[derive(Default)]
+    struct CaptureReporter {
+        events: Mutex<Vec<Phase>>,
+    }
+
+    impl ProgressReporter for CaptureReporter {
+        fn on_event(&self, event: ProgressEvent<'_>) {
+            let mut log = self.events.lock().unwrap();
+            log.push(match event {
+                ProgressEvent::ScanStarted { .. } => Phase::ScanStart,
+                ProgressEvent::ScanProgress {
+                    slices_done,
+                    total_slices,
+                    ..
+                } => Phase::ScanProgress(slices_done, total_slices),
+                ProgressEvent::ScanCompleted { .. } => Phase::ScanEnd,
+                ProgressEvent::EncodeStarted {
+                    volume_index,
+                    total_volumes,
+                    input_blocks,
+                    recovery_blocks,
+                } => Phase::EncodeStart(volume_index, total_volumes, input_blocks, recovery_blocks),
+                ProgressEvent::EncodeProgress {
+                    volume_index,
+                    input_block_done,
+                    input_blocks,
+                } => Phase::EncodeProgress(volume_index, input_block_done, input_blocks),
+                ProgressEvent::EncodeCompleted { volume_index } => Phase::EncodeEnd(volume_index),
+                ProgressEvent::IndexWritten { .. } => Phase::IndexWritten,
+                ProgressEvent::VolumeWritten { .. } => Phase::VolumeWritten,
+            });
+        }
+    }
 
     fn make_source(dir: &Path, name: &str, content: &[u8], slice: u64) -> SourceFile {
         let p = dir.join(name);
@@ -945,5 +1045,129 @@ mod tests {
         let s = out.to_string_lossy();
         assert!(s.starts_with(r"\\?\"), "missing prefix: {s}");
         assert!(s.len() > 260, "expected >260 chars, got {}", s.len());
+    }
+
+    #[test]
+    fn progress_events_fire_in_order_for_create_with_recovery() {
+        let dir = tempdir().unwrap();
+        // 4-byte slices, 20-byte file → 5 input blocks. 2 recovery blocks in
+        // a single volume.
+        let p = dir.path().join("a.bin");
+        std::fs::write(&p, b"hello par2 world!!!!").unwrap();
+        let out = dir.path().join("recovery.par2");
+
+        let reporter = CaptureReporter::default();
+        let src =
+            SourceFile::scan_with_progress(&p, b"a.bin".to_vec(), 4, Some(&reporter)).unwrap();
+        let files = run_create_with_progress(
+            &CreateOptions {
+                output: out.clone(),
+                slice_size: 4,
+                recovery_block_count: 2,
+                volume_scheme: VolumeScheme::Single,
+            },
+            &[src],
+            Some(&reporter),
+        )
+        .unwrap();
+        assert_eq!(files.len(), 2);
+
+        let events = reporter.events.lock().unwrap();
+        // Scan precedes encode precedes writes.
+        let first_encode = events
+            .iter()
+            .position(|e| matches!(e, Phase::EncodeStart(..)))
+            .expect("EncodeStart present");
+        let first_index = events
+            .iter()
+            .position(|e| matches!(e, Phase::IndexWritten))
+            .expect("IndexWritten present");
+        let first_volume = events
+            .iter()
+            .position(|e| matches!(e, Phase::VolumeWritten))
+            .expect("VolumeWritten present");
+        assert!(first_encode > 0);
+        // IndexWritten fires before any volume encoding starts.
+        assert!(first_index < first_encode);
+        // VolumeWritten fires after encoding completes.
+        let last_encode_end = events
+            .iter()
+            .rposition(|e| matches!(e, Phase::EncodeEnd(_)))
+            .unwrap();
+        assert!(first_volume > last_encode_end);
+
+        // Final encode progress reaches input_blocks total.
+        let final_encode_progress = events
+            .iter()
+            .filter_map(|e| match e {
+                Phase::EncodeProgress(_, done, total) => Some((*done, *total)),
+                _ => None,
+            })
+            .next_back()
+            .expect("encode progress fired at least once");
+        assert_eq!(
+            final_encode_progress.0, final_encode_progress.1,
+            "last EncodeProgress must reach total"
+        );
+        // 5 input blocks expected.
+        assert_eq!(final_encode_progress.1, 5);
+
+        // Final scan progress reaches total_slices.
+        let final_scan_progress = events
+            .iter()
+            .filter_map(|e| match e {
+                Phase::ScanProgress(done, total) => Some((*done, *total)),
+                _ => None,
+            })
+            .next_back()
+            .expect("scan progress fired at least once");
+        assert_eq!(final_scan_progress.0, final_scan_progress.1);
+
+        // Exactly one EncodeStart/EncodeEnd pair (single volume).
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Phase::EncodeStart(..)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Phase::EncodeEnd(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn run_create_with_and_without_reporter_produce_identical_output() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        let src1 = make_source(dir1.path(), "a.bin", b"hello par2 world!!!!", 4);
+        let src2 = make_source(dir2.path(), "a.bin", b"hello par2 world!!!!", 4);
+
+        let opts1 = CreateOptions {
+            output: dir1.path().join("recovery.par2"),
+            slice_size: 4,
+            recovery_block_count: 2,
+            volume_scheme: VolumeScheme::Single,
+        };
+        let opts2 = CreateOptions {
+            output: dir2.path().join("recovery.par2"),
+            slice_size: 4,
+            recovery_block_count: 2,
+            volume_scheme: VolumeScheme::Single,
+        };
+
+        let files1 = run_create(&opts1, &[src1]).unwrap();
+        let reporter = CaptureReporter::default();
+        let files2 = run_create_with_progress(&opts2, &[src2], Some(&reporter)).unwrap();
+        assert_eq!(files1.len(), files2.len());
+        for (a, b) in files1.iter().zip(files2.iter()) {
+            let bytes_a = std::fs::read(a).unwrap();
+            let bytes_b = std::fs::read(b).unwrap();
+            assert_eq!(bytes_a, bytes_b, "files differ");
+        }
     }
 }
