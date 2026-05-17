@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 use clap::{Parser, Subcommand};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use par2rust::{
-    run_create, CreateOptions, Par2Error, SourceFile, VolumeScheme, MAX_RECOVERY_BLOCKS,
+    run_create_with_progress, CreateOptions, Par2Error, ProgressEvent, ProgressReporter,
+    SourceFile, VolumeScheme, MAX_RECOVERY_BLOCKS,
 };
 
 #[derive(Parser, Debug)]
@@ -99,17 +102,19 @@ fn run_create_cli(args: CreateArgs) -> Result<(), Par2Error> {
         }
     }
 
+    let reporter = CliReporter::new();
+
     // Scan every input file before writing anything.
     let mut sources = Vec::with_capacity(args.inputs.len());
     for input in &args.inputs {
         let display = display_name_for(input);
-        let src = SourceFile::scan(input, display, args.slice_size)?;
+        let src = SourceFile::scan_with_progress(input, display, args.slice_size, Some(&reporter))?;
         sources.push(src);
     }
 
     let volume_scheme = build_volume_scheme(&args, &sources)?;
 
-    let written = run_create(
+    let written = run_create_with_progress(
         &CreateOptions {
             output: args.archive.clone(),
             slice_size: args.slice_size,
@@ -117,7 +122,10 @@ fn run_create_cli(args: CreateArgs) -> Result<(), Par2Error> {
             volume_scheme,
         },
         &sources,
+        Some(&reporter),
     )?;
+
+    reporter.finish();
 
     println!(
         "Wrote {} file{}:",
@@ -186,6 +194,116 @@ fn build_volume_scheme(
         max_blocks_per_volume: cap,
         inner: Box::new(inner),
     })
+}
+
+/// Two-bar progress reporter built on `indicatif`: one bar for the scan
+/// phase (slices across all input files) and one for the encode phase
+/// (input-block work across all recovery volumes).
+struct CliReporter {
+    multi: MultiProgress,
+    scan: Mutex<Option<ProgressBar>>,
+    scan_base: Mutex<u64>,
+    encode: Mutex<Option<ProgressBar>>,
+}
+
+impl CliReporter {
+    fn new() -> Self {
+        Self {
+            multi: MultiProgress::new(),
+            scan: Mutex::new(None),
+            scan_base: Mutex::new(0),
+            encode: Mutex::new(None),
+        }
+    }
+
+    fn finish(&self) {
+        if let Some(pb) = self.scan.lock().unwrap().take() {
+            pb.finish_and_clear();
+        }
+        if let Some(pb) = self.encode.lock().unwrap().take() {
+            pb.finish_and_clear();
+        }
+    }
+
+    fn ensure_scan_bar(&self, total: u64) -> ProgressBar {
+        let mut guard = self.scan.lock().unwrap();
+        if let Some(pb) = guard.as_ref() {
+            return pb.clone();
+        }
+        let pb = self.multi.add(ProgressBar::new(total));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "scan   [{bar:30.cyan/blue}] {pos}/{len} slices ({eta}) {wide_msg}",
+            )
+            .unwrap()
+            .progress_chars("=> "),
+        );
+        *guard = Some(pb.clone());
+        pb
+    }
+
+    fn ensure_encode_bar(&self) -> ProgressBar {
+        let mut guard = self.encode.lock().unwrap();
+        if let Some(pb) = guard.as_ref() {
+            return pb.clone();
+        }
+        let pb = self.multi.add(ProgressBar::new(0));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "encode [{bar:30.green/blue}] {pos}/{len} blocks ({eta}) {wide_msg}",
+            )
+            .unwrap()
+            .progress_chars("=> "),
+        );
+        *guard = Some(pb.clone());
+        pb
+    }
+}
+
+impl ProgressReporter for CliReporter {
+    fn on_event(&self, event: ProgressEvent<'_>) {
+        match event {
+            ProgressEvent::ScanStarted { path, total_slices } => {
+                let pb = self.ensure_scan_bar(0);
+                pb.inc_length(total_slices);
+                pb.set_message(format!("{}", path.display()));
+            }
+            ProgressEvent::ScanProgress { slices_done, .. } => {
+                if let Some(pb) = self.scan.lock().unwrap().as_ref() {
+                    let base = *self.scan_base.lock().unwrap();
+                    pb.set_position(base + slices_done);
+                }
+            }
+            ProgressEvent::ScanCompleted { .. } => {
+                // Advance the baseline so the next file picks up where this
+                // one left off on the cumulative bar.
+                if let Some(pb) = self.scan.lock().unwrap().as_ref() {
+                    *self.scan_base.lock().unwrap() = pb.position();
+                }
+            }
+            ProgressEvent::EncodeStarted {
+                volume_index,
+                total_volumes,
+                input_blocks,
+                ..
+            } => {
+                let pb = self.ensure_encode_bar();
+                pb.set_length(input_blocks);
+                pb.set_position(0);
+                pb.set_message(format!("volume {}/{}", volume_index + 1, total_volumes));
+            }
+            ProgressEvent::EncodeProgress {
+                input_block_done, ..
+            } => {
+                if let Some(pb) = self.encode.lock().unwrap().as_ref() {
+                    pb.set_position(input_block_done);
+                }
+            }
+            ProgressEvent::EncodeCompleted { .. } => {}
+            ProgressEvent::IndexWritten { .. } | ProgressEvent::VolumeWritten { .. } => {}
+            _ => {}
+        }
+    }
 }
 
 /// Pick the bytes to record as the filename inside the PAR2 packet. We use the

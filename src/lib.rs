@@ -45,11 +45,14 @@ pub mod format;
 pub mod galois;
 pub mod galois_simd;
 pub mod packet;
+pub mod progress;
 pub mod reedsolomon;
 pub mod source;
 
 pub use creator::{
-    run_create, write_index_file, CreateOptions, VolumeScheme, MAX_FILES, MAX_RECOVERY_BLOCKS,
+    run_create, run_create_with_progress, write_index_file, CreateOptions, VolumeScheme, MAX_FILES,
+    MAX_RECOVERY_BLOCKS,
 };
 pub use error::{Par2Error, Result};
+pub use progress::{ProgressEvent, ProgressReporter};
 pub use source::SourceFile;

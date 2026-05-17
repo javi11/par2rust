@@ -6,6 +6,7 @@ use md5::{Digest, Md5};
 
 use crate::error::{Par2Error, Result};
 use crate::format::{md5_of, Md5Hash};
+use crate::progress::{tick_stride, ProgressEvent, ProgressReporter};
 
 /// Length of the "first chunk" hashed into `hash16k`. The PAR2 spec hard-codes
 /// this to 16 384 bytes — for files smaller than that, only the available bytes
@@ -42,6 +43,17 @@ impl SourceFile {
     /// is what will be embedded in the `FileDescriptionPacket` — typically the
     /// filename component relative to a chosen basepath.
     pub fn scan(path: &Path, display_name: Vec<u8>, slice_size: u64) -> Result<Self> {
+        Self::scan_with_progress(path, display_name, slice_size, None)
+    }
+
+    /// Like [`SourceFile::scan`] but emits progress events through `reporter`.
+    /// Pass `None` for behaviour identical to `scan`.
+    pub fn scan_with_progress(
+        path: &Path,
+        display_name: Vec<u8>,
+        slice_size: u64,
+        reporter: Option<&dyn ProgressReporter>,
+    ) -> Result<Self> {
         if display_name.is_empty() || display_name.contains(&0) {
             return Err(Par2Error::InvalidFileName(path.to_path_buf()));
         }
@@ -53,6 +65,12 @@ impl SourceFile {
         if length == 0 {
             return Err(Par2Error::EmptyFile(path.to_path_buf()));
         }
+
+        let total_slices = length.div_ceil(slice_size);
+        if let Some(r) = reporter {
+            r.on_event(ProgressEvent::ScanStarted { path, total_slices });
+        }
+        let stride = tick_stride(total_slices);
 
         let file = File::open(path)?;
         let mut reader = BufReader::with_capacity(1 << 16, file);
@@ -82,7 +100,8 @@ impl SourceFile {
             }
 
             // For per-slice checksums, the trailing partial slice is zero-padded.
-            if filled < slice_buf.len() {
+            let was_partial = filled < slice_buf.len();
+            if was_partial {
                 slice_buf[filled..].fill(0);
             }
 
@@ -96,7 +115,19 @@ impl SourceFile {
 
             slice_checksums.push(SliceChecksum { md5, crc32 });
 
-            if filled < slice_buf.len() {
+            if let Some(r) = reporter {
+                let done = slice_checksums.len() as u64;
+                let is_last = was_partial || done == total_slices;
+                if is_last || done % stride == 0 {
+                    r.on_event(ProgressEvent::ScanProgress {
+                        path,
+                        slices_done: done,
+                        total_slices,
+                    });
+                }
+            }
+
+            if was_partial {
                 break;
             }
         }
@@ -104,6 +135,10 @@ impl SourceFile {
         let hash_full: Md5Hash = hash_full_ctx.finalize().into();
         let hash16k: Md5Hash = hash16k_ctx.finalize().into();
         let file_id = compute_file_id(&hash16k, length, &display_name);
+
+        if let Some(r) = reporter {
+            r.on_event(ProgressEvent::ScanCompleted { path });
+        }
 
         Ok(SourceFile {
             name: display_name,
