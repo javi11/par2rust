@@ -472,7 +472,10 @@ pub enum CoeffSimdTables {
     /// Scalar log/antilog path. Stores only the coefficient.
     Scalar(u16),
     /// Byte-split (256-entry) scalar fallback used on x86_64 without SSSE3.
-    TableScalar(CoeffTables),
+    /// Boxed because `CoeffTables` is ~1 KiB while the SIMD variants are
+    /// 128 B — keeping it inline would bloat the whole enum and the
+    /// per-slice `Vec<CoeffSimdTables>` the encoder allocates.
+    TableScalar(Box<CoeffTables>),
     #[cfg(target_arch = "aarch64")]
     Neon(neon::NeonTables),
     #[cfg(target_arch = "x86_64")]
@@ -488,7 +491,9 @@ impl CoeffSimdTables {
         }
         match dispatch {
             Dispatch::Scalar => CoeffSimdTables::Scalar(coeff),
-            Dispatch::TableScalar => CoeffSimdTables::TableScalar(CoeffTables::new(coeff)),
+            Dispatch::TableScalar => {
+                CoeffSimdTables::TableScalar(Box::new(CoeffTables::new(coeff)))
+            }
             #[cfg(target_arch = "aarch64")]
             Dispatch::Neon => {
                 let byte_tables = CoeffTables::new(coeff);

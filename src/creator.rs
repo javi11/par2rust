@@ -7,9 +7,7 @@ use rayon::prelude::*;
 
 use crate::error::{Par2Error, Result};
 use crate::format::Md5Hash;
-use crate::galois_simd::{
-    detect_dispatch, gf_mul_xor_with_tables, CoeffSimdTables, Dispatch,
-};
+use crate::galois_simd::{detect_dispatch, gf_mul_xor_with_tables, CoeffSimdTables, Dispatch};
 use crate::packet::comment::build_comment_packets;
 use crate::packet::creator::build_creator_packet;
 use crate::packet::file_desc::build_file_desc_packet;
