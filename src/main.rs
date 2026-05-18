@@ -90,7 +90,7 @@ struct CreateArgs {
     /// ParPar-style alias for the output archive name. When given, all
     /// positional arguments are treated as inputs (no positional `<ARCHIVE>`
     /// is expected).
-    #[arg(long = "out", value_name = "PATH")]
+    #[arg(short = 'o', long = "out", value_name = "PATH")]
     out: Option<PathBuf>,
 
     /// Embed a PAR2 comment packet (matches ParPar's `--comment`). Repeat for
@@ -101,12 +101,12 @@ struct CreateArgs {
 
     /// Walk directory inputs recursively (matches ParPar's `--recurse`).
     /// Without this flag, a directory in `<INPUTS>` is an error.
-    #[arg(long = "recurse", default_value_t = false)]
+    #[arg(short = 'R', long = "recurse", default_value_t = false)]
     recurse: bool,
 
     /// Read additional input paths (one per line) from a file. Use `-` to read
     /// from stdin. Composes with positional inputs.
-    #[arg(long = "input-file", value_name = "PATH")]
+    #[arg(short = 'i', long = "input-file", value_name = "PATH")]
     input_file: Option<PathBuf>,
 
     /// Suppress progress bars and the final summary. Errors still print to

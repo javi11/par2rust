@@ -90,25 +90,26 @@ accepted, alongside the par2cmdline flags. Where ParPar's short flag conflicts
 with par2cmdline (`-c`, `-n`, `-r`), only the long form is offered:
 
 ```bash
-# --out: alternate to the positional <ARCHIVE>. When --out is given, every
+# -o/--out: alternate to the positional <ARCHIVE>. When --out is given, every
 # positional argument is treated as an input file.
-par2rust create --out backup.par2 a.bin b.bin
+par2rust create -o backup.par2 a.bin b.bin
 
 # --comment: embed a comment packet (repeatable). Non-ASCII text additionally
-# emits a Unicode comment packet linked to the ASCII variant.
+# emits a Unicode comment packet linked to the ASCII variant. (Long-only —
+# par2cmdline already uses -c for --recovery-count.)
 par2rust create --comment "release v1.2" --comment "by alice" backup.par2 data.bin
 
-# --recurse: walk directory inputs recursively (without it, a directory input
-# is an error).
-par2rust create --recurse backup.par2 ./photos
+# -R/--recurse: walk directory inputs recursively (without it, a directory
+# input is an error).
+par2rust create -R backup.par2 ./photos
 
-# --input-file: read additional input paths from a newline-separated file
+# -i/--input-file: read additional input paths from a newline-separated file
 # (use "-" to read from stdin). Composes with positional inputs.
-par2rust create --input-file files.txt backup.par2
+par2rust create -i files.txt backup.par2
 
-# --quiet: suppress progress bars and the "Wrote N files" summary. Errors
+# -q/--quiet: suppress progress bars and the "Wrote N files" summary. Errors
 # still go to stderr.
-par2rust create --quiet backup.par2 data.bin
+par2rust create -q backup.par2 data.bin
 
 # --version: print version and exit.
 par2rust --version
