@@ -8,13 +8,14 @@ license = "GPL-2.0-or-later"
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:indicatif"]
+cli = ["dep:clap", "dep:indicatif", "dep:walkdir"]
 
 [dependencies]
 md-5 = "0.10"
 crc32fast = "1.4"
 clap = { version = "4", features = ["derive"], optional = true }
 indicatif = { version = "0.17", optional = true }
+walkdir = { version = "2", optional = true }
 thiserror = "1"
 cpufeatures = "0.2"
 rayon = "1.10"

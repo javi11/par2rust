@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use crate::error::{Par2Error, Result};
 use crate::format::Md5Hash;
 use crate::galois_simd::{detect_dispatch, gf_mul_xor_dispatch, Dispatch};
+use crate::packet::comment::build_comment_packets;
 use crate::packet::creator::build_creator_packet;
 use crate::packet::file_desc::build_file_desc_packet;
 use crate::packet::file_verify::build_file_verify_packet;
@@ -68,6 +69,11 @@ pub struct CreateOptions {
     /// callers; the CLI overrides this with [`VolumeScheme::Exponential`] to
     /// match `par2cmdline`'s default behaviour.
     pub volume_scheme: VolumeScheme,
+    /// Optional comment packets to embed alongside the critical packets.
+    /// Each entry produces an ASCII comment packet; entries with any
+    /// non-ASCII character additionally produce a Unicode comment packet
+    /// linked to the ASCII variant (matches ParPar's `-c/--comment`).
+    pub comments: Vec<String>,
 }
 
 impl Default for CreateOptions {
@@ -77,6 +83,7 @@ impl Default for CreateOptions {
             slice_size: 4096,
             recovery_block_count: 0,
             volume_scheme: VolumeScheme::Single,
+            comments: Vec::new(),
         }
     }
 }
@@ -126,6 +133,9 @@ pub fn run_create_with_progress(
     }
     let creator_pkt = build_creator_packet(&set_id_hash);
     critical_packets.extend_from_slice(&creator_pkt);
+    if !opts.comments.is_empty() {
+        critical_packets.extend_from_slice(&build_comment_packets(&set_id_hash, &opts.comments));
+    }
 
     write_atomic(&opts.output, &critical_packets)?;
     if let Some(r) = reporter {
@@ -287,6 +297,7 @@ pub fn write_index_file(opts: &CreateOptions, sources: &[SourceFile]) -> Result<
         slice_size: opts.slice_size,
         recovery_block_count: 0,
         volume_scheme: VolumeScheme::Single,
+        comments: opts.comments.clone(),
     };
     let files = run_create(&no_recovery, sources)?;
     Ok(files
@@ -589,6 +600,7 @@ mod tests {
                 slice_size: 4,
                 recovery_block_count: 0,
                 volume_scheme: VolumeScheme::Single,
+                comments: Vec::new(),
             },
             &[src],
         )
@@ -610,6 +622,7 @@ mod tests {
                 slice_size: 4,
                 recovery_block_count: 2,
                 volume_scheme: VolumeScheme::Single,
+                comments: Vec::new(),
             },
             &[src],
         )
@@ -631,6 +644,7 @@ mod tests {
                 slice_size: 4,
                 recovery_block_count: 0,
                 volume_scheme: VolumeScheme::Single,
+                comments: Vec::new(),
             },
             &[],
         )
@@ -649,6 +663,7 @@ mod tests {
                 slice_size: 4,
                 recovery_block_count: MAX_RECOVERY_BLOCKS + 1,
                 volume_scheme: VolumeScheme::Single,
+                comments: Vec::new(),
             },
             &[src],
         )
@@ -667,6 +682,7 @@ mod tests {
                 slice_size: 4,
                 recovery_block_count: 0,
                 volume_scheme: VolumeScheme::Single,
+                comments: Vec::new(),
             },
             &[src],
         )
@@ -729,6 +745,7 @@ mod tests {
                 slice_size: 4096,
                 recovery_block_count: 10,
                 volume_scheme: VolumeScheme::Exponential,
+                comments: Vec::new(),
             },
             &[src],
         )
@@ -763,6 +780,7 @@ mod tests {
                 slice_size: 4,
                 recovery_block_count: 5,
                 volume_scheme: VolumeScheme::Explicit(vec![2, 2]),
+                comments: Vec::new(),
             },
             &[src],
         )
@@ -784,6 +802,7 @@ mod tests {
                 slice_size: 4,
                 recovery_block_count: 4,
                 volume_scheme: VolumeScheme::Explicit(vec![2, 0, 2]),
+                comments: Vec::new(),
             },
             &[src],
         )
@@ -804,6 +823,7 @@ mod tests {
                 slice_size: 4096,
                 recovery_block_count: 6,
                 volume_scheme: VolumeScheme::Explicit(vec![3, 3]),
+                comments: Vec::new(),
             },
             &[src],
         )
@@ -922,6 +942,7 @@ mod tests {
                 slice_size: 4096,
                 recovery_block_count: 10,
                 volume_scheme: VolumeScheme::Uniform { count: 4 },
+                comments: Vec::new(),
             },
             &[src],
         )
@@ -1065,6 +1086,7 @@ mod tests {
                 slice_size: 4,
                 recovery_block_count: 2,
                 volume_scheme: VolumeScheme::Single,
+                comments: Vec::new(),
             },
             &[src],
             Some(&reporter),
@@ -1152,12 +1174,14 @@ mod tests {
             slice_size: 4,
             recovery_block_count: 2,
             volume_scheme: VolumeScheme::Single,
+            comments: Vec::new(),
         };
         let opts2 = CreateOptions {
             output: dir2.path().join("recovery.par2"),
             slice_size: 4,
             recovery_block_count: 2,
             volume_scheme: VolumeScheme::Single,
+            comments: Vec::new(),
         };
 
         let files1 = run_create(&opts1, &[src1]).unwrap();

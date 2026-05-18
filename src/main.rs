@@ -1,3 +1,4 @@
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -86,12 +87,37 @@ struct CreateArgs {
     #[arg(short = 't', long = "threads", default_value_t = 0)]
     threads: usize,
 
-    /// Output PAR2 archive name. Volume files are derived from this name.
-    archive: PathBuf,
+    /// ParPar-style alias for the output archive name. When given, all
+    /// positional arguments are treated as inputs (no positional `<ARCHIVE>`
+    /// is expected).
+    #[arg(short = 'o', long = "out", value_name = "PATH")]
+    out: Option<PathBuf>,
 
-    /// Input files to protect.
-    #[arg(required = true)]
-    inputs: Vec<PathBuf>,
+    /// Embed a PAR2 comment packet (matches ParPar's `--comment`). Repeat for
+    /// multiple comments. Non-ASCII text additionally produces a Unicode
+    /// comment packet linked to the ASCII variant.
+    #[arg(long = "comment", value_name = "TEXT")]
+    comments: Vec<String>,
+
+    /// Walk directory inputs recursively (matches ParPar's `--recurse`).
+    /// Without this flag, a directory in `<INPUTS>` is an error.
+    #[arg(short = 'R', long = "recurse", default_value_t = false)]
+    recurse: bool,
+
+    /// Read additional input paths (one per line) from a file. Use `-` to read
+    /// from stdin. Composes with positional inputs.
+    #[arg(short = 'i', long = "input-file", value_name = "PATH")]
+    input_file: Option<PathBuf>,
+
+    /// Suppress progress bars and the final summary. Errors still print to
+    /// stderr.
+    #[arg(short = 'q', long = "quiet", default_value_t = false)]
+    quiet: bool,
+
+    /// Positional arguments: when `--out` is NOT given, the first entry is the
+    /// output archive name and the rest are inputs. When `--out` IS given,
+    /// every entry is an input.
+    positionals: Vec<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -117,13 +143,22 @@ fn run_create_cli(args: CreateArgs) -> Result<(), Par2Error> {
         }
     }
 
+    // Resolve effective output path + raw input list from positionals.
+    let (output, raw_inputs) = resolve_output_and_inputs(&args)?;
+    let expanded_inputs = expand_input_paths(&raw_inputs, args.recurse)?;
+    if expanded_inputs.is_empty() {
+        return Err(Par2Error::NoInputFiles);
+    }
+
     let reporter = CliReporter::new();
+    let reporter_arg: Option<&dyn ProgressReporter> =
+        if args.quiet { None } else { Some(&reporter) };
 
     // Scan every input file before writing anything.
-    let mut sources = Vec::with_capacity(args.inputs.len());
-    for input in &args.inputs {
+    let mut sources = Vec::with_capacity(expanded_inputs.len());
+    for input in &expanded_inputs {
         let display = display_name_for(input);
-        let src = SourceFile::scan_with_progress(input, display, args.slice_size, Some(&reporter))?;
+        let src = SourceFile::scan_with_progress(input, display, args.slice_size, reporter_arg)?;
         sources.push(src);
     }
 
@@ -139,27 +174,108 @@ fn run_create_cli(args: CreateArgs) -> Result<(), Par2Error> {
 
     let written = run_create_with_progress(
         &CreateOptions {
-            output: args.archive.clone(),
+            output: output.clone(),
             slice_size: args.slice_size,
             recovery_block_count: recovery_count,
             volume_scheme,
+            comments: args.comments.clone(),
         },
         &sources,
-        Some(&reporter),
+        reporter_arg,
     )?;
 
-    reporter.finish();
-
-    println!(
-        "Wrote {} file{}:",
-        written.len(),
-        if written.len() == 1 { "" } else { "s" }
-    );
-    for p in &written {
-        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-        println!("  {} ({} bytes)", p.display(), size);
+    if !args.quiet {
+        reporter.finish();
+        println!(
+            "Wrote {} file{}:",
+            written.len(),
+            if written.len() == 1 { "" } else { "s" }
+        );
+        for p in &written {
+            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            println!("  {} ({} bytes)", p.display(), size);
+        }
     }
     Ok(())
+}
+
+/// Resolve the effective output archive path and the raw input list from the
+/// CLI's positional arguments and `--out` / `--input-file` flags.
+///
+/// - With `--out PATH`: every positional is an input.
+/// - Without `--out`: the first positional is the archive, rest are inputs.
+fn resolve_output_and_inputs(args: &CreateArgs) -> Result<(PathBuf, Vec<PathBuf>), Par2Error> {
+    let (output, positional_inputs) = match &args.out {
+        Some(path) => (path.clone(), args.positionals.clone()),
+        None => {
+            let mut iter = args.positionals.iter().cloned();
+            let archive = iter.next().ok_or_else(|| {
+                Par2Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing output archive: pass it as the first positional argument or use --out PATH",
+                ))
+            })?;
+            (archive, iter.collect())
+        }
+    };
+
+    let mut inputs = positional_inputs;
+    if let Some(list_path) = &args.input_file {
+        inputs.extend(read_input_file_list(list_path)?);
+    }
+    Ok((output, inputs))
+}
+
+/// Read newline-separated paths from `path`. A path of `-` reads from stdin.
+/// Blank lines and lines starting with `#` are ignored.
+fn read_input_file_list(path: &Path) -> Result<Vec<PathBuf>, Par2Error> {
+    let is_stdin = path.as_os_str() == "-";
+    let lines: Vec<String> = if is_stdin {
+        let stdin = std::io::stdin();
+        let reader = stdin.lock();
+        reader.lines().collect::<std::io::Result<Vec<String>>>()?
+    } else {
+        let file = std::fs::File::open(path)?;
+        BufReader::new(file)
+            .lines()
+            .collect::<std::io::Result<Vec<String>>>()?
+    };
+    Ok(lines
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(PathBuf::from)
+        .collect())
+}
+
+/// Expand each raw input path: if it's a directory and `--recurse` is set,
+/// walk it and collect file entries; otherwise pass through. Directory
+/// entries without `--recurse` produce an error.
+fn expand_input_paths(raw: &[PathBuf], recurse: bool) -> Result<Vec<PathBuf>, Par2Error> {
+    let mut out = Vec::with_capacity(raw.len());
+    for p in raw {
+        let meta = match std::fs::metadata(p) {
+            Ok(m) => m,
+            Err(e) => return Err(Par2Error::Io(e)),
+        };
+        if meta.is_dir() {
+            if !recurse {
+                return Err(Par2Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("input {p:?} is a directory; pass --recurse to walk it recursively"),
+                )));
+            }
+            for entry in walkdir::WalkDir::new(p).follow_links(false) {
+                let entry = entry.map_err(|e| std::io::Error::other(e.to_string()))?;
+                if entry.file_type().is_file() {
+                    out.push(entry.into_path());
+                }
+            }
+        } else {
+            out.push(p.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// par2cmdline's heuristic for the default number of uniform recovery volumes

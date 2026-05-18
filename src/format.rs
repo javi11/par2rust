@@ -9,6 +9,8 @@ pub const TYPE_FILE_VERIFY: [u8; 16] = *b"PAR 2.0\0IFSC\0\0\0\0";
 pub const TYPE_MAIN: [u8; 16] = *b"PAR 2.0\0Main\0\0\0\0";
 pub const TYPE_RECOVERY: [u8; 16] = *b"PAR 2.0\0RecvSlic";
 pub const TYPE_CREATOR: [u8; 16] = *b"PAR 2.0\0Creator\0";
+pub const TYPE_COMMENT_ASCII: [u8; 16] = *b"PAR 2.0\0CommASCI";
+pub const TYPE_COMMENT_UNICODE: [u8; 16] = *b"PAR 2.0\0CommUni\0";
 
 pub type Md5Hash = [u8; 16];
 
@@ -73,6 +75,10 @@ mod tests {
         assert_eq!(&TYPE_FILE_VERIFY, b"PAR 2.0\0IFSC\0\0\0\0");
         assert_eq!(&TYPE_RECOVERY, b"PAR 2.0\0RecvSlic");
         assert_eq!(&TYPE_CREATOR, b"PAR 2.0\0Creator\0");
+        // ParPar emits comment packets with these 16-byte type IDs; see
+        // animetosho/ParPar lib/par2.js makePacketComment.
+        assert_eq!(&TYPE_COMMENT_ASCII, b"PAR 2.0\0CommASCI");
+        assert_eq!(&TYPE_COMMENT_UNICODE, b"PAR 2.0\0CommUni\0");
     }
 
     #[test]

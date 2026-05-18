@@ -1,3 +1,4 @@
+pub mod comment;
 pub mod creator;
 pub mod file_desc;
 pub mod file_verify;
