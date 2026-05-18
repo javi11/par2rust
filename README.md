@@ -18,6 +18,8 @@ quickpar, multipar) can verify and repair files using the output.
 - ✅ Tests against upstream `par2 v` and `par2 r`
 - ✅ Distribution flags: `-u` (uniform),
   `-l` (limit volume size to largest source file), `-n<count>` (volume count)
+- ✅ ParPar-style flags: `--out`, `--comment`, `--recurse`, `--input-file`,
+  `--quiet`
 - 🚧 **Not implemented**: verify, repair, PAR1 legacy format
 
 ## Install / build
@@ -79,6 +81,37 @@ Verify and repair with upstream tools:
 ```bash
 par2 v backup.par2          # verify
 par2 r backup.par2          # repair if any data file is damaged
+```
+
+### ParPar-style flags
+
+A small subset of [ParPar](https://github.com/animetosho/ParPar)'s CLI is also
+accepted, alongside the par2cmdline flags. Where ParPar's short flag conflicts
+with par2cmdline (`-c`, `-n`, `-r`), only the long form is offered:
+
+```bash
+# --out: alternate to the positional <ARCHIVE>. When --out is given, every
+# positional argument is treated as an input file.
+par2rust create --out backup.par2 a.bin b.bin
+
+# --comment: embed a comment packet (repeatable). Non-ASCII text additionally
+# emits a Unicode comment packet linked to the ASCII variant.
+par2rust create --comment "release v1.2" --comment "by alice" backup.par2 data.bin
+
+# --recurse: walk directory inputs recursively (without it, a directory input
+# is an error).
+par2rust create --recurse backup.par2 ./photos
+
+# --input-file: read additional input paths from a newline-separated file
+# (use "-" to read from stdin). Composes with positional inputs.
+par2rust create --input-file files.txt backup.par2
+
+# --quiet: suppress progress bars and the "Wrote N files" summary. Errors
+# still go to stderr.
+par2rust create --quiet backup.par2 data.bin
+
+# --version: print version and exit.
+par2rust --version
 ```
 
 ## Use as a library

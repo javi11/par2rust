@@ -26,6 +26,7 @@ fn upstream_accepts_index_only_archive() {
             slice_size: 4096,
             recovery_block_count: 0,
             volume_scheme: VolumeScheme::Single,
+            comments: Vec::new(),
         },
         &[src],
     )
@@ -69,6 +70,7 @@ fn upstream_accepts_multi_file_index() {
             slice_size: 4096,
             recovery_block_count: 0,
             volume_scheme: VolumeScheme::Single,
+            comments: Vec::new(),
         },
         &srcs,
     )

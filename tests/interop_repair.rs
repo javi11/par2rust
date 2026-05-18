@@ -36,6 +36,7 @@ fn single_file_repair_round_trip() {
             slice_size: 4096,
             recovery_block_count: 4,
             volume_scheme: VolumeScheme::Single,
+            comments: Vec::new(),
         },
         &[src],
     )
@@ -102,6 +103,7 @@ fn multi_file_repair_round_trip() {
             slice_size: 4096,
             recovery_block_count: 5,
             volume_scheme: VolumeScheme::Single,
+            comments: Vec::new(),
         },
         &srcs,
     )
@@ -147,6 +149,7 @@ fn exponential_split_repair_round_trip() {
             slice_size: 4096,
             recovery_block_count: 10,
             volume_scheme: VolumeScheme::Exponential,
+            comments: Vec::new(),
         },
         &[src],
     )
@@ -225,6 +228,7 @@ fn deep_exponential_split_repair_round_trip() {
             slice_size: 4096,
             recovery_block_count: 50,
             volume_scheme: VolumeScheme::Exponential,
+            comments: Vec::new(),
         },
         &[src],
     )
@@ -297,6 +301,7 @@ fn explicit_volume_layout_repair_round_trip() {
             slice_size: 4096,
             recovery_block_count: layout.iter().sum(),
             volume_scheme: VolumeScheme::Explicit(layout.clone()),
+            comments: Vec::new(),
         },
         &[src],
     )
