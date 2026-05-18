@@ -384,10 +384,7 @@ fn resolve_redundancy(
     sources: &[SourceFile],
     slice_size: u64,
 ) -> Result<u32, Par2Error> {
-    let total_input_blocks: u64 = sources
-        .iter()
-        .map(|s| s.slice_checksums.len() as u64)
-        .sum();
+    let total_input_blocks: u64 = sources.iter().map(|s| s.slice_checksums.len() as u64).sum();
 
     let blocks: u64 = match r {
         Redundancy::Percent(p) => {
