@@ -32,8 +32,16 @@ enum CliCommand {
 
 #[derive(clap::Args, Debug)]
 struct CreateArgs {
-    /// Block (slice) size in bytes. Must be a positive multiple of 4.
-    #[arg(short = 's', long = "slice-size", default_value_t = 4096)]
+    /// Block (slice) size in bytes. Must be a positive multiple of 4. An
+    /// optional suffix selects binary units: `b`/`B` = bytes (no-op),
+    /// `k`/`K` = KiB, `m`/`M` = MiB, `g`/`G` = GiB. E.g. `-s 768000b`,
+    /// `-s 750K`, `-s 1M`.
+    #[arg(
+        short = 's',
+        long = "slice-size",
+        default_value = "4096",
+        value_parser = parse_slice_size
+    )]
     slice_size: u64,
 
     /// Number of recovery blocks to generate.
@@ -333,6 +341,33 @@ fn display_name_for(input: &Path) -> Vec<u8> {
         .unwrap_or_else(|| input.as_os_str().as_encoded_bytes().to_vec())
 }
 
+/// Parse a `--slice-size` argument. Accepts a bare integer (bytes) or an
+/// integer with a trailing unit suffix: `b`/`B` (bytes), `k`/`K` (KiB),
+/// `m`/`M` (MiB), `g`/`G` (GiB). This matches parpar's convention, so
+/// wrappers built for parpar (e.g. Postie passing `768000b`) work unchanged.
+fn parse_slice_size(s: &str) -> Result<u64, String> {
+    if s.is_empty() {
+        return Err("slice size is empty".into());
+    }
+    let last = *s.as_bytes().last().unwrap();
+    let (digits, shift) = match last {
+        b'b' | b'B' => (&s[..s.len() - 1], 0u32),
+        b'k' | b'K' => (&s[..s.len() - 1], 10u32),
+        b'm' | b'M' => (&s[..s.len() - 1], 20u32),
+        b'g' | b'G' => (&s[..s.len() - 1], 30u32),
+        _ => (s, 0u32),
+    };
+    if digits.is_empty() {
+        return Err(format!("slice size '{s}' is missing a numeric value"));
+    }
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("slice size '{s}' has invalid number '{digits}'"))?;
+    let multiplier = 1u64 << shift;
+    n.checked_mul(multiplier)
+        .ok_or_else(|| format!("slice size '{s}' overflows u64"))
+}
+
 /// par2cmdline `-r` value. Either a percentage of the total input data, or a
 /// target recovery-data size in bytes (binary units, matching the convention
 /// used by par2cmdline and friends).
@@ -446,6 +481,43 @@ mod tests {
         assert!(Redundancy::from_str("abc").is_err());
         assert!(Redundancy::from_str("k").is_err());
         assert!(Redundancy::from_str("-5").is_err());
+    }
+
+    #[test]
+    fn slice_size_bare_integer() {
+        assert_eq!(parse_slice_size("4096").unwrap(), 4096);
+        assert_eq!(parse_slice_size("768000").unwrap(), 768000);
+    }
+
+    #[test]
+    fn slice_size_byte_suffix() {
+        assert_eq!(parse_slice_size("768000b").unwrap(), 768000);
+        assert_eq!(parse_slice_size("768000B").unwrap(), 768000);
+    }
+
+    #[test]
+    fn slice_size_binary_units() {
+        assert_eq!(parse_slice_size("750K").unwrap(), 750 * 1024);
+        assert_eq!(parse_slice_size("750k").unwrap(), 750 * 1024);
+        assert_eq!(parse_slice_size("1M").unwrap(), 1 << 20);
+        assert_eq!(parse_slice_size("1m").unwrap(), 1 << 20);
+        assert_eq!(parse_slice_size("2G").unwrap(), 2u64 << 30);
+        assert_eq!(parse_slice_size("2g").unwrap(), 2u64 << 30);
+    }
+
+    #[test]
+    fn slice_size_rejects_bad_input() {
+        assert!(parse_slice_size("").is_err());
+        assert!(parse_slice_size("b").is_err());
+        assert!(parse_slice_size("K").is_err());
+        assert!(parse_slice_size("abc").is_err());
+        assert!(parse_slice_size("12x").is_err());
+        assert!(parse_slice_size("-5").is_err());
+    }
+
+    #[test]
+    fn slice_size_rejects_overflow() {
+        assert!(parse_slice_size("99999999999G").is_err());
     }
 
     fn fake_sources_with_blocks(total_blocks: usize) -> Vec<SourceFile> {
