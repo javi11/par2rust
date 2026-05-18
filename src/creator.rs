@@ -1,13 +1,13 @@
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
 use crate::error::{Par2Error, Result};
 use crate::format::Md5Hash;
-use crate::galois_simd::{detect_dispatch, gf_mul_xor_dispatch, Dispatch};
+use crate::galois_simd::{detect_dispatch, gf_mul_xor_with_tables, CoeffSimdTables, Dispatch};
 use crate::packet::comment::build_comment_packets;
 use crate::packet::creator::build_creator_packet;
 use crate::packet::file_desc::build_file_desc_packet;
@@ -20,6 +20,10 @@ use crate::source::SourceFile;
 
 /// Maximum number of input files PAR2 supports.
 pub const MAX_FILES: usize = 32_768;
+/// Maximum number of input blocks (slices) PAR2 supports. This is φ(65535) —
+/// the count of GF(2^16) bases whose discrete log is coprime to 65535, which
+/// the Vandermonde RS matrix requires to remain invertible.
+pub const MAX_INPUT_BLOCKS: u32 = 32_768;
 /// Maximum number of recovery blocks per PAR2 set (16-bit exponent space).
 pub const MAX_RECOVERY_BLOCKS: u32 = 65_535;
 
@@ -117,6 +121,19 @@ pub fn run_create_with_progress(
     }
     if opts.slice_size == 0 || opts.slice_size % 4 != 0 {
         return Err(Par2Error::InvalidSliceSize(opts.slice_size));
+    }
+
+    let total_input_blocks: u64 = sources.iter().map(|s| s.slice_checksums.len() as u64).sum();
+    if total_input_blocks > MAX_INPUT_BLOCKS as u64 {
+        let total_bytes: u64 = sources.iter().map(|s| s.length).sum();
+        // Smallest multiple-of-4 slice_size keeping total slices <= MAX_INPUT_BLOCKS.
+        let raw = total_bytes.div_ceil(MAX_INPUT_BLOCKS as u64);
+        let suggested = raw.div_ceil(4) * 4;
+        return Err(Par2Error::TooManyInputBlocks {
+            count: total_input_blocks,
+            slice_size: opts.slice_size,
+            suggested,
+        });
     }
 
     let file_ids: Vec<Md5Hash> = sources.iter().map(|s| s.file_id).collect();
@@ -361,43 +378,58 @@ fn build_volume_file(
         .collect();
 
     // 4. Stream input blocks one slice at a time, accumulating into all
-    //    recovery buffers. Each file is opened once; slices are read in order.
+    //    recovery buffers. Each file is opened once and read strictly
+    //    sequentially — `input_blocks` iterates slice_idx 0..N contiguously
+    //    within each file, so no seek is needed.
     let mut slice_buf = vec![0u8; slice_size_usize];
     let mut current_file: Option<(usize, BufReader<File>)> = None;
+    // Reusable scratch for the per-slice precomputed dispatch tables — sized
+    // once at `recovery_count` and overwritten in place per slice to avoid
+    // re-allocating `Vec<CoeffSimdTables>` on every input block.
+    let workers = rayon::current_num_threads().max(1);
+    let chunk_len = recovery_count.div_ceil(workers).max(1);
 
-    for (input_idx, (file_idx, slice_idx)) in input_blocks.iter().enumerate() {
-        // Open or reuse the reader for this file.
-        let reader = match &mut current_file {
-            Some((idx, r)) if *idx == *file_idx => r,
-            _ => {
-                let f = File::open(to_long_path(&sources[*file_idx].path))?;
-                current_file = Some((*file_idx, BufReader::with_capacity(1 << 16, f)));
-                let (_, r) = current_file.as_mut().unwrap();
-                r
-            }
-        };
+    for (input_idx, (file_idx, _slice_idx)) in input_blocks.iter().enumerate() {
+        // Open the reader for a new file. Within a file, slices are read in
+        // order and we never seek — the BufReader's 64 KiB readahead keeps
+        // throughput close to the disk's sequential ceiling.
+        let switched_file = !matches!(&current_file, Some((idx, _)) if *idx == *file_idx);
+        if switched_file {
+            let f = File::open(to_long_path(&sources[*file_idx].path))?;
+            current_file = Some((*file_idx, BufReader::with_capacity(1 << 16, f)));
+        }
+        let reader = &mut current_file.as_mut().unwrap().1;
 
-        // Seek to the slice (BufReader's internal seek discards its buffer for
-        // any non-trivial movement; explicit seek is the most correct way).
-        let offset = slice_size * slice_idx;
-        reader.seek(SeekFrom::Start(offset))?;
         let filled = read_full(reader, &mut slice_buf)?;
         if filled < slice_buf.len() {
             slice_buf[filled..].fill(0);
         }
 
-        // Accumulate into every recovery buffer. Each buffer is disjoint, so
-        // rayon hands out exclusive `&mut [u8]` slots with zero locking. `rs`
-        // and `dispatch` are `&`/`Copy`, and `slice_buf` is read-only here.
+        // Precompute one SIMD lookup table per recovery row for THIS input
+        // slice's column of the RS matrix. Previously the table was rebuilt
+        // inside `gf_mul_xor_dispatch` on every (input, recovery) iteration,
+        // i.e. `input_count * recovery_count` times — the rebuild dominates
+        // the SIMD multiply-XOR for the workloads we care about.
         //
-        // Split the recovery_buffers slice into roughly one chunk per worker
-        // thread. Per-buffer work is ~50 µs of SIMD; scheduling each buffer as
-        // its own task would have rayon's scheduler dominate the runtime,
-        // especially at low thread counts. Chunked iteration keeps task count
-        // == thread count and lets each task run a tight serial inner loop.
+        // The build itself is parallelised because there's no data dependency
+        // across recovery rows. For typical create jobs (R = 50..500) this
+        // amortises perfectly across rayon workers.
+        let coeff_tables: Vec<CoeffSimdTables> = (0..recovery_count)
+            .into_par_iter()
+            .map(|r_idx| {
+                let coeff = rs.coefficient(r_idx, input_idx);
+                CoeffSimdTables::new(dispatch, coeff)
+            })
+            .collect();
+
+        // Accumulate into every recovery buffer. Each buffer is disjoint, so
+        // rayon hands out exclusive `&mut [u8]` slots with zero locking.
+        // `coeff_tables` and `slice_buf` are read-only here.
+        //
+        // Chunked iteration keeps task count == thread count and lets each
+        // task run a tight serial inner SIMD loop.
         let slice_ref: &[u8] = &slice_buf;
-        let workers = rayon::current_num_threads().max(1);
-        let chunk_len = recovery_buffers.len().div_ceil(workers).max(1);
+        let tables_ref: &[CoeffSimdTables] = &coeff_tables;
         recovery_buffers
             .par_chunks_mut(chunk_len)
             .enumerate()
@@ -405,8 +437,7 @@ fn build_volume_file(
                 let base = chunk_idx * chunk_len;
                 for (offset, out) in chunk.iter_mut().enumerate() {
                     let r_idx = base + offset;
-                    let coeff = rs.coefficient(r_idx, input_idx);
-                    gf_mul_xor_dispatch(dispatch, coeff, slice_ref, out);
+                    gf_mul_xor_with_tables(&tables_ref[r_idx], slice_ref, out);
                 }
             });
 
@@ -650,6 +681,57 @@ mod tests {
         )
         .unwrap_err();
         matches!(err, Par2Error::NoInputFiles);
+    }
+
+    #[test]
+    fn errors_when_total_slices_exceed_max_input_blocks() {
+        use crate::source::SliceChecksum;
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("r.par2");
+        let slice_size: u64 = 4;
+        let blocks = (MAX_INPUT_BLOCKS as usize) + 1;
+        // Fabricate a SourceFile directly — scanning a multi-GB synthetic
+        // file would dominate test time. The encoder never runs because
+        // run_create_with_progress rejects up front.
+        let fake = SourceFile {
+            name: b"big.bin".to_vec(),
+            path: dir.path().join("big.bin"),
+            length: blocks as u64 * slice_size,
+            hash_full: [0u8; 16],
+            hash16k: [0u8; 16],
+            file_id: [0u8; 16],
+            slice_checksums: vec![
+                SliceChecksum {
+                    md5: [0u8; 16],
+                    crc32: 0,
+                };
+                blocks
+            ],
+        };
+        let err = run_create(
+            &CreateOptions {
+                output: out,
+                slice_size,
+                recovery_block_count: 1,
+                volume_scheme: VolumeScheme::Single,
+                comments: Vec::new(),
+            },
+            &[fake],
+        )
+        .unwrap_err();
+        match err {
+            Par2Error::TooManyInputBlocks {
+                count,
+                slice_size: ss,
+                suggested,
+            } => {
+                assert_eq!(count, blocks as u64);
+                assert_eq!(ss, slice_size);
+                assert!(suggested > slice_size);
+                assert_eq!(suggested % 4, 0);
+            }
+            other => panic!("expected TooManyInputBlocks, got {other:?}"),
+        }
     }
 
     #[test]

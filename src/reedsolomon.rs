@@ -134,7 +134,7 @@ fn generate_input_bases(count: usize) -> Vec<u16> {
     while bases.len() < count {
         if logbase >= FIELD_LIMIT {
             // PAR2 caps input blocks at 32768 — long before this branch could fire
-            // we'd already have hit `Par2Error::TooManyFiles` upstream.
+            // we'd already have hit `Par2Error::TooManyInputBlocks` upstream.
             panic!(
                 "exhausted GF(2^16) bases coprime to {} (asked for {})",
                 FIELD_LIMIT, count

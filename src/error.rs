@@ -26,6 +26,16 @@ pub enum Par2Error {
     #[error("recovery block count {0} exceeds PAR2 limit of 65535")]
     TooManyRecoveryBlocks(u32),
 
+    #[error(
+        "too many input blocks ({count}) at slice_size {slice_size}; \
+         PAR2 caps total slices at 32768 — retry with slice_size >= {suggested}"
+    )]
+    TooManyInputBlocks {
+        count: u64,
+        slice_size: u64,
+        suggested: u64,
+    },
+
     #[error("invalid volume scheme: {0}")]
     InvalidVolumeScheme(String),
 }
