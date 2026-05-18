@@ -456,33 +456,79 @@ pub fn detect_dispatch() -> Dispatch {
 /// Apply `output ^= coeff · input` using the best available path. This is the
 /// safe public entrypoint that all SIMD `unsafe` work is funneled through.
 pub fn gf_mul_xor_dispatch(dispatch: Dispatch, coeff: u16, input: &[u8], output: &mut [u8]) {
-    if coeff == 0 {
-        return;
-    }
-    if coeff == 1 {
-        for (o, i) in output.iter_mut().zip(input.iter()) {
-            *o ^= *i;
+    let tables = CoeffSimdTables::new(dispatch, coeff);
+    gf_mul_xor_with_tables(&tables, input, output);
+}
+
+/// Pre-built per-coefficient lookup tables for whichever dispatch path is in
+/// use. Building one of these is the expensive part of an encode step — the
+/// matrix-shaped hot loop in PAR2 reuses the same recovery-row coefficient
+/// against many input blocks (and vice versa), so the encoder builds these
+/// once per slice and reuses them across all recovery buffers in the
+/// parallel inner loop. See `creator.rs::build_volume_file`.
+pub enum CoeffSimdTables {
+    /// `coeff ∈ {0, 1}` — handled inline, no table needed.
+    Trivial(u16),
+    /// Scalar log/antilog path. Stores only the coefficient.
+    Scalar(u16),
+    /// Byte-split (256-entry) scalar fallback used on x86_64 without SSSE3.
+    TableScalar(CoeffTables),
+    #[cfg(target_arch = "aarch64")]
+    Neon(neon::NeonTables),
+    #[cfg(target_arch = "x86_64")]
+    Ssse3(x86::X86Tables),
+}
+
+impl CoeffSimdTables {
+    /// Build the per-coefficient lookup tables that the selected dispatch path
+    /// needs. Trivial coefficients (0 and 1) skip table construction entirely.
+    pub fn new(dispatch: Dispatch, coeff: u16) -> Self {
+        if coeff == 0 || coeff == 1 {
+            return CoeffSimdTables::Trivial(coeff);
         }
-        return;
+        match dispatch {
+            Dispatch::Scalar => CoeffSimdTables::Scalar(coeff),
+            Dispatch::TableScalar => CoeffSimdTables::TableScalar(CoeffTables::new(coeff)),
+            #[cfg(target_arch = "aarch64")]
+            Dispatch::Neon => {
+                let byte_tables = CoeffTables::new(coeff);
+                CoeffSimdTables::Neon(neon::NeonTables::from_coeff_tables(&byte_tables))
+            }
+            #[cfg(target_arch = "x86_64")]
+            Dispatch::Ssse3 => {
+                let byte_tables = CoeffTables::new(coeff);
+                CoeffSimdTables::Ssse3(x86::X86Tables::from_coeff_tables(&byte_tables))
+            }
+        }
     }
+}
 
-    let byte_tables = CoeffTables::new(coeff);
-
-    match dispatch {
-        Dispatch::Scalar => gf_mul_xor_scalar(coeff, input, output),
-        Dispatch::TableScalar => gf_mul_xor_table_scalar(&byte_tables, input, output),
+/// Apply `output ^= coeff · input` using a pre-built dispatch table. This is
+/// the SIMD-only hot-path entrypoint — it does no table construction, so the
+/// encoder loop is pure SIMD work.
+pub fn gf_mul_xor_with_tables(tables: &CoeffSimdTables, input: &[u8], output: &mut [u8]) {
+    match tables {
+        CoeffSimdTables::Trivial(0) => {}
+        CoeffSimdTables::Trivial(1) => {
+            for (o, i) in output.iter_mut().zip(input.iter()) {
+                *o ^= *i;
+            }
+        }
+        CoeffSimdTables::Trivial(_) => unreachable!("Trivial holds only 0 or 1"),
+        CoeffSimdTables::Scalar(coeff) => gf_mul_xor_scalar(*coeff, input, output),
+        CoeffSimdTables::TableScalar(t) => gf_mul_xor_table_scalar(t, input, output),
         #[cfg(target_arch = "aarch64")]
-        Dispatch::Neon => {
-            let neon_t = neon::NeonTables::from_coeff_tables(&byte_tables);
-            // SAFETY: NEON is part of the aarch64 base ISA. Buffer length is
+        CoeffSimdTables::Neon(t) => {
+            // SAFETY: NEON is part of the aarch64 base ISA. Buffer lengths are
             // validated by debug assertions in the callee.
-            unsafe { neon::gf_mul_xor_neon(&neon_t, input, output) };
+            unsafe { neon::gf_mul_xor_neon(t, input, output) };
         }
         #[cfg(target_arch = "x86_64")]
-        Dispatch::Ssse3 => {
-            let x86_t = x86::X86Tables::from_coeff_tables(&byte_tables);
-            // SAFETY: caller-selected Dispatch::Ssse3 implies SSSE3 detected at startup.
-            unsafe { x86::gf_mul_xor_ssse3(&x86_t, input, output) };
+        CoeffSimdTables::Ssse3(t) => {
+            // SAFETY: a Ssse3 variant is only constructed via `CoeffSimdTables::new`
+            // when the caller passed `Dispatch::Ssse3`, which itself only comes
+            // from `detect_dispatch()` after a runtime SSSE3 check.
+            unsafe { x86::gf_mul_xor_ssse3(t, input, output) };
         }
     }
 }
