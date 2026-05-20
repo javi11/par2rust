@@ -3,71 +3,43 @@ use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-use memmap2::Mmap;
 use rayon::prelude::*;
 
-/// Fallback BufReader capacity for the encode read path on platforms where
-/// mmap is unavailable. Must match `source::FALLBACK_READ_CAPACITY` in spirit:
-/// 4 MiB keeps cold sequential reads close to the disk ceiling.
-const FALLBACK_READ_CAPACITY: usize = 4 * 1024 * 1024;
+/// BufReader capacity for the encode source-read path. 4 MiB keeps the
+/// sequential read close to the disk's streaming ceiling while overlapping
+/// nicely with the SIMD encode work, without spending much RAM.
+const ENCODE_READ_CAPACITY: usize = 4 * 1024 * 1024;
 
-/// Source-file reader used by the encode loop. Prefers mmap so the OS page
-/// cache absorbs the inevitable re-read after the scan phase; falls back to a
-/// 4 MiB BufReader on platforms / file systems where mmap fails (e.g. some
-/// Windows network shares).
-enum SourceReader {
-    Mmap(Mmap),
-    Buffered(BufReader<File>),
+/// Sequential reader used by the single-pass encoder. Each source file is
+/// opened once and read strictly in order; the kernel's sequential readahead
+/// keeps the input pipeline fed while the SIMD encode work runs.
+///
+/// We deliberately do not use `mmap` here: with the single-pass encoder the
+/// source is read exactly once, and on macOS in particular `mmap` pages
+/// don't stay warm across long encode passes, so re-faulting dominates the
+/// cost. `BufReader` lets the kernel's readahead win.
+struct SourceReader {
+    reader: BufReader<File>,
 }
 
 impl SourceReader {
     fn open(path: &Path) -> std::io::Result<Self> {
         let f = File::open(path)?;
-        // Diagnostic escape hatch: when PAR2RUST_DISABLE_MMAP_ENCODE is set
-        // (any value), skip the mmap fast path and use the 4 MiB BufReader
-        // fallback. Lets callers A/B the encode-side mmap without rebuilding.
-        let mmap_disabled = std::env::var_os("PAR2RUST_DISABLE_MMAP_ENCODE").is_some();
-        if !mmap_disabled {
-            // SAFETY: PAR2 input is read-only by contract. If the user mutates
-            // the file while we read it the resulting recovery data is simply
-            // wrong — not UB in the Rust sense. Same exposure as BufReader.
-            if let Ok(m) = unsafe { Mmap::map(&f) } {
-                return Ok(SourceReader::Mmap(m));
-            }
-        }
-        Ok(SourceReader::Buffered(BufReader::with_capacity(
-            FALLBACK_READ_CAPACITY,
-            f,
-        )))
+        Ok(SourceReader {
+            reader: BufReader::with_capacity(ENCODE_READ_CAPACITY, f),
+        })
     }
 
-    /// Fill `slice_buf` with the bytes of slice `slice_idx`, zero-padding any
-    /// tail that runs past EOF (PAR2 spec: trailing partial slice is zero-padded
-    /// before checksumming / encoding).
-    fn read_slice(&mut self, slice_idx: usize, slice_buf: &mut [u8]) -> std::io::Result<()> {
-        match self {
-            SourceReader::Mmap(m) => {
-                let start = slice_idx.saturating_mul(slice_buf.len());
-                let end = std::cmp::min(start.saturating_add(slice_buf.len()), m.len());
-                let src = if start < m.len() {
-                    &m[start..end]
-                } else {
-                    &[][..]
-                };
-                slice_buf[..src.len()].copy_from_slice(src);
-                if src.len() < slice_buf.len() {
-                    slice_buf[src.len()..].fill(0);
-                }
-                Ok(())
-            }
-            SourceReader::Buffered(r) => {
-                let filled = read_full(r, slice_buf)?;
-                if filled < slice_buf.len() {
-                    slice_buf[filled..].fill(0);
-                }
-                Ok(())
-            }
+    /// Read the next `slice_buf.len()` bytes (or fewer at EOF), zero-padding
+    /// any tail that runs past EOF (PAR2 spec: trailing partial slice is
+    /// zero-padded before checksumming / encoding). Callers iterate slices
+    /// strictly in order — no seeks.
+    fn read_next_slice(&mut self, slice_buf: &mut [u8]) -> std::io::Result<()> {
+        let filled = read_full(&mut self.reader, slice_buf)?;
+        if filled < slice_buf.len() {
+            slice_buf[filled..].fill(0);
         }
+        Ok(())
     }
 }
 
@@ -228,10 +200,30 @@ pub fn run_create_with_progress(
 
     if opts.recovery_block_count > 0 {
         let sizes = resolve_volume_sizes(&opts.volume_scheme, opts.recovery_block_count)?;
-        let total_volumes = sizes.len() as u32;
+
+        // SINGLE-PASS ENCODE: compute every recovery block in one sweep of
+        // the source, then split the populated buffers into per-volume
+        // files. Previously each volume re-opened the source and re-read
+        // it end-to-end, so on a 3.5 GiB / 7-volume workload the encode
+        // phase paid ~7 sequential reads of the source. Folding into one
+        // pass cuts that to a single read.
+        let recovery_buffers = encode_all_recovery_blocks(
+            sources,
+            opts.slice_size,
+            opts.recovery_block_count,
+            reporter,
+        )?;
+
+        // Serialise per-volume: each volume gets a contiguous slice of the
+        // global recovery_buffers, starting at `first_exp`. With the
+        // single-pass encoder all computation already happened above; this
+        // loop only packs bytes and writes files. The encode-phase progress
+        // events (`EncodeStarted` / `EncodeProgress` / `EncodeCompleted`)
+        // are emitted with `total_volumes = 1` from inside
+        // `encode_all_recovery_blocks`, so consumers see one contiguous
+        // encode phase followed by a burst of `VolumeWritten` events.
         let mut first_exp: u32 = 0;
-        for (volume_index, count) in sizes.into_iter().enumerate() {
-            let volume_index = volume_index as u32;
+        for count in sizes.into_iter() {
             // first_exp + count <= recovery_block_count <= 65535, so the u16
             // cast is always safe — we validated the total against
             // MAX_RECOVERY_BLOCKS above.
@@ -239,17 +231,14 @@ pub fn run_create_with_progress(
                 .try_into()
                 .expect("first_exp fits in u16 because total <= MAX_RECOVERY_BLOCKS");
             let vol_path = derive_volume_filename(&opts.output, first_exp_u16, count);
-            let vol_bytes = build_volume_file(
+            let r_start = first_exp as usize;
+            let r_end = r_start + count as usize;
+            let vol_bytes = build_volume_packet(
                 &set_id_hash,
                 &critical_packets,
-                sources,
-                opts.slice_size,
+                &recovery_buffers[r_start..r_end],
                 first_exp_u16,
-                count,
-                volume_index,
-                total_volumes,
-                reporter,
-            )?;
+            );
             write_atomic(&vol_path, &vol_bytes)?;
             if let Some(r) = reporter {
                 r.on_event(ProgressEvent::VolumeWritten { path: &vol_path });
@@ -393,22 +382,33 @@ pub fn write_index_file(opts: &CreateOptions, sources: &[SourceFile]) -> Result<
 /// recovery packets in exponent order, then critical packets again (the
 /// upstream convention — improves the chance that the index can be
 /// reconstructed from any single volume file alone).
-#[allow(clippy::too_many_arguments)]
-fn build_volume_file(
-    set_id_hash: &Md5Hash,
-    critical_packets: &[u8],
+/// Compute every recovery block across every volume in a single pass over
+/// the source files. Returns `recovery_buffers[exp]` for exp in
+/// `0..total_recovery_count` — already populated, ready to be split into
+/// per-volume `.par2` files by [`build_volume_packet`].
+///
+/// This is the perf-critical inner loop of PAR2 create. Each source file is
+/// opened and read **exactly once**, streamed through a 4 MiB `BufReader`.
+/// For each input slice we compute the per-recovery-row SIMD coefficient
+/// tables and accumulate the slice into every recovery buffer in parallel
+/// via rayon. The old code re-read the source once per output volume; for
+/// par2cmdline's default exponential split (7 volumes on the user's 3.5 GiB
+/// workload) this was a 7× I/O regression.
+///
+/// Emits a single `EncodeStarted` / `EncodeProgress` / `EncodeCompleted`
+/// triplet with `volume_index = 0` and `total_volumes = 1`, treating the
+/// whole encode as one phase. Per-volume serialisation (and the
+/// `VolumeWritten` events) happen in the caller after this returns.
+fn encode_all_recovery_blocks(
     sources: &[SourceFile],
     slice_size: u64,
-    first_exponent: u16,
-    recovery_block_count: u32,
-    volume_index: u32,
-    total_volumes: u32,
+    total_recovery_count: u32,
     reporter: Option<&dyn ProgressReporter>,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
     let slice_size_usize: usize = slice_size
         .try_into()
         .map_err(|_| Par2Error::InvalidSliceSize(slice_size))?;
-    let recovery_count = recovery_block_count as usize;
+    let recovery_count = total_recovery_count as usize;
 
     // 1. Compute the flat input-block list across all sources.
     let mut input_blocks: Vec<(usize, u64)> = Vec::new();
@@ -421,39 +421,38 @@ fn build_volume_file(
     let input_blocks_total = input_blocks.len() as u64;
     if let Some(r) = reporter {
         r.on_event(ProgressEvent::EncodeStarted {
-            volume_index,
-            total_volumes,
+            volume_index: 0,
+            total_volumes: 1,
             input_blocks: input_blocks_total,
-            recovery_blocks: recovery_block_count,
+            recovery_blocks: total_recovery_count,
         });
     }
     let progress_stride = tick_stride(input_blocks_total);
 
-    // 2. Initialise RS encoder + dispatch path.
-    let rs = RsEncoder::new(
-        input_blocks.len() as u32,
-        first_exponent,
-        recovery_block_count,
-    );
+    // 2. Initialise RS encoder for the full recovery range. `first_exponent`
+    //    is 0 so `rs.recovery_exponents[r] == r`.
+    let rs = RsEncoder::new(input_blocks.len() as u32, 0, total_recovery_count);
     let dispatch = detect_dispatch();
 
     // 3. Allocate one zeroed buffer per recovery block. Total memory:
-    //    recovery_count · slice_size. PAR2's defaults keep this in the low MB.
+    //    recovery_count · slice_size. For the user's workload
+    //    (36 × 10 MiB) this is ~360 MiB — comfortable on any modern desktop.
     let mut recovery_buffers: Vec<Vec<u8>> = (0..recovery_count)
         .map(|_| vec![0u8; slice_size_usize])
         .collect();
 
-    // 4. Stream input blocks one slice at a time, accumulating into all
-    //    recovery buffers. Each file is opened (and mmap'd) once. With mmap
-    //    the kernel page cache typically still has the bytes warm from the
-    //    scan pass, so this loop pays no second physical read.
+    // 4. Stream input slices once, in file then slice order. Each file is
+    //    opened once and read strictly sequentially with a 4 MiB BufReader,
+    //    so the kernel's sequential readahead overlaps disk I/O with the
+    //    SIMD work below.
     let mut slice_buf = vec![0u8; slice_size_usize];
     let mut current_file: Option<(usize, SourceReader)> = None;
     let workers = rayon::current_num_threads().max(1);
     let chunk_len = recovery_count.div_ceil(workers).max(1);
 
-    for (input_idx, (file_idx, slice_idx)) in input_blocks.iter().enumerate() {
-        // (Re)open the reader on file boundaries.
+    for (input_idx, (file_idx, _slice_idx)) in input_blocks.iter().enumerate() {
+        // (Re)open the reader on file boundaries. Slices within a file are
+        // contiguous in `input_blocks`, so a plain sequential read is enough.
         let switched_file = !matches!(&current_file, Some((idx, _)) if *idx == *file_idx);
         if switched_file {
             let reader = SourceReader::open(&to_long_path(&sources[*file_idx].path))?;
@@ -461,17 +460,11 @@ fn build_volume_file(
         }
         let reader = &mut current_file.as_mut().unwrap().1;
 
-        reader.read_slice(*slice_idx as usize, &mut slice_buf)?;
+        reader.read_next_slice(&mut slice_buf)?;
 
         // Precompute one SIMD lookup table per recovery row for THIS input
-        // slice's column of the RS matrix. Previously the table was rebuilt
-        // inside `gf_mul_xor_dispatch` on every (input, recovery) iteration,
-        // i.e. `input_count * recovery_count` times — the rebuild dominates
-        // the SIMD multiply-XOR for the workloads we care about.
-        //
-        // The build itself is parallelised because there's no data dependency
-        // across recovery rows. For typical create jobs (R = 50..500) this
-        // amortises perfectly across rayon workers.
+        // slice's column of the RS matrix. Parallelised across rayon workers
+        // because each table build is independent.
         let coeff_tables: Vec<CoeffSimdTables> = (0..recovery_count)
             .into_par_iter()
             .map(|r_idx| {
@@ -482,10 +475,6 @@ fn build_volume_file(
 
         // Accumulate into every recovery buffer. Each buffer is disjoint, so
         // rayon hands out exclusive `&mut [u8]` slots with zero locking.
-        // `coeff_tables` and `slice_buf` are read-only here.
-        //
-        // Chunked iteration keeps task count == thread count and lets each
-        // task run a tight serial inner SIMD loop.
         let slice_ref: &[u8] = &slice_buf;
         let tables_ref: &[CoeffSimdTables] = &coeff_tables;
         recovery_buffers
@@ -503,7 +492,7 @@ fn build_volume_file(
             let done = (input_idx as u64) + 1;
             if done == input_blocks_total || done % progress_stride == 0 {
                 r.on_event(ProgressEvent::EncodeProgress {
-                    volume_index,
+                    volume_index: 0,
                     input_block_done: done,
                     input_blocks: input_blocks_total,
                 });
@@ -512,24 +501,38 @@ fn build_volume_file(
     }
     drop(current_file);
 
-    // 5. Build recovery packets in exponent order.
-    let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(critical_packets);
-    for (r_idx, buf) in recovery_buffers.iter().enumerate() {
-        let exp = rs.recovery_exponents[r_idx];
-        let pkt = build_recovery_packet(set_id_hash, exp, buf);
-        out.extend_from_slice(&pkt);
-    }
-    out.extend_from_slice(critical_packets);
-
     // Sanity: silences `dispatch` going unused on exotic targets.
     let _ = (dispatch, &Dispatch::Scalar);
 
     if let Some(r) = reporter {
-        r.on_event(ProgressEvent::EncodeCompleted { volume_index });
+        r.on_event(ProgressEvent::EncodeCompleted { volume_index: 0 });
     }
 
-    Ok(out)
+    Ok(recovery_buffers)
+}
+
+/// Serialise a per-volume slice of the global recovery buffer into a
+/// complete `.vol*.par2` file body: critical packets, then the volume's
+/// recovery packets in exponent order, then critical packets again
+/// (par2cmdline convention — improves the chance that the index can be
+/// reconstructed from any single volume file alone).
+fn build_volume_packet(
+    set_id_hash: &Md5Hash,
+    critical_packets: &[u8],
+    recovery_slots: &[Vec<u8>],
+    first_exponent: u16,
+) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(critical_packets);
+    for (offset, buf) in recovery_slots.iter().enumerate() {
+        // first_exponent + offset <= total_recovery_count <= MAX_RECOVERY_BLOCKS = 65535,
+        // so the u16 cast is always safe.
+        let exp = first_exponent + offset as u16;
+        let pkt = build_recovery_packet(set_id_hash, exp, buf);
+        out.extend_from_slice(&pkt);
+    }
+    out.extend_from_slice(critical_packets);
+    out
 }
 
 /// Build a volume filename like `recovery.vol0+4.par2` from a base index path
