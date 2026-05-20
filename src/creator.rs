@@ -2,7 +2,9 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use memmap2::Mmap;
 use rayon::prelude::*;
 
 /// BufReader capacity for the encode source-read path. 4 MiB keeps the
@@ -54,7 +56,7 @@ use crate::packet::main_packet::{build_main_packet, MainPacket};
 use crate::packet::recovery::build_recovery_packet;
 use crate::progress::{tick_stride, ProgressEvent, ProgressReporter};
 use crate::reedsolomon::RsEncoder;
-use crate::source::SourceFile;
+use crate::source::{compute_file_id, scan_via_mmap, SourceFile};
 
 /// Maximum number of input files PAR2 supports.
 pub const MAX_FILES: usize = 32_768;
@@ -359,6 +361,391 @@ fn cap_volume_sizes(sizes: &[u32], cap: u32) -> Vec<u32> {
         }
     }
     out
+}
+
+/// Fused create entry point: takes a list of `(path, display_name)` pairs
+/// instead of pre-scanned [`SourceFile`]s, and runs **scan and encode
+/// concurrently against a single mmap'd view of each source**. The kernel
+/// page cache serves both walks from one physical read of the file, and
+/// the encode SIMD work overlaps with the (serial) `hash_full` MD5 chain.
+///
+/// For workloads where scan dominates (large source files where
+/// MD5(entire file) is the bottleneck), this folds the encode wall time
+/// into the scan window — the run finishes in roughly
+/// `max(scan_time, encode_time)` instead of `scan_time + encode_time`.
+///
+/// Falls back to the legacy
+/// [`run_create_with_progress`] code path internally if `Mmap::map` fails
+/// for any source (e.g. unusual file systems / network shares).
+pub fn run_create_fused(
+    opts: &CreateOptions,
+    inputs: &[(PathBuf, Vec<u8>)],
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<Vec<PathBuf>> {
+    if inputs.is_empty() {
+        return Err(Par2Error::NoInputFiles);
+    }
+    if inputs.len() > MAX_FILES {
+        return Err(Par2Error::TooManyFiles(inputs.len()));
+    }
+    if opts.recovery_block_count > MAX_RECOVERY_BLOCKS {
+        return Err(Par2Error::TooManyRecoveryBlocks(opts.recovery_block_count));
+    }
+    if opts.slice_size == 0 || opts.slice_size % 4 != 0 {
+        return Err(Par2Error::InvalidSliceSize(opts.slice_size));
+    }
+    let slice_size = opts.slice_size;
+    let slice_size_usize: usize = slice_size
+        .try_into()
+        .map_err(|_| Par2Error::InvalidSliceSize(slice_size))?;
+
+    // Stat all inputs up front: lets us validate the total block count
+    // (and bail with a useful suggested slice_size) without partially
+    // scanning anything.
+    let mut lengths: Vec<u64> = Vec::with_capacity(inputs.len());
+    let mut total_input_blocks: u64 = 0;
+    for (path, display_name) in inputs {
+        if display_name.is_empty() || display_name.contains(&0) {
+            return Err(Par2Error::InvalidFileName(path.clone()));
+        }
+        let len = std::fs::metadata(path)?.len();
+        if len == 0 {
+            return Err(Par2Error::EmptyFile(path.clone()));
+        }
+        lengths.push(len);
+        total_input_blocks += len.div_ceil(slice_size);
+    }
+    if total_input_blocks > MAX_INPUT_BLOCKS as u64 {
+        let total_bytes: u64 = lengths.iter().sum();
+        let raw = total_bytes.div_ceil(MAX_INPUT_BLOCKS as u64);
+        let suggested = raw.div_ceil(4) * 4;
+        return Err(Par2Error::TooManyInputBlocks {
+            count: total_input_blocks,
+            slice_size,
+            suggested,
+        });
+    }
+
+    // Allocate the global recovery buffers (one slot per recovery block
+    // across all volumes — same layout as the single-pass encoder).
+    let total_recovery_count = opts.recovery_block_count;
+    let mut recovery_buffers: Vec<Vec<u8>> = if total_recovery_count > 0 {
+        (0..total_recovery_count as usize)
+            .map(|_| vec![0u8; slice_size_usize])
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let rs = if total_recovery_count > 0 {
+        Some(RsEncoder::new(
+            total_input_blocks as u32,
+            0,
+            total_recovery_count,
+        ))
+    } else {
+        None
+    };
+    let dispatch = detect_dispatch();
+    let _ = &Dispatch::Scalar; // silence unused-variant warning on exotic targets
+
+    // Emit a single combined `EncodeStarted` for the whole encode phase.
+    // The scan phase emits its own ScanStarted / ScanProgress / ScanCompleted
+    // events from `scan_via_mmap`, concurrently with this. Progress events
+    // from both phases interleave at the reporter; postie-core's
+    // RatioReporter is keyed on the event type so this is fine.
+    if total_recovery_count > 0 {
+        if let Some(r) = reporter {
+            r.on_event(ProgressEvent::EncodeStarted {
+                volume_index: 0,
+                total_volumes: 1,
+                input_blocks: total_input_blocks,
+                recovery_blocks: total_recovery_count,
+            });
+        }
+    }
+    let encode_progress_stride = tick_stride(total_input_blocks);
+    let encode_progress_counter = AtomicU64::new(0);
+
+    let mut sources: Vec<SourceFile> = Vec::with_capacity(inputs.len());
+    let mut encode_failed: Option<Par2Error> = None;
+
+    for ((path, display_name), &length) in inputs.iter().zip(lengths.iter()) {
+        let total_slices = length.div_ceil(slice_size);
+        if let Some(r) = reporter {
+            r.on_event(ProgressEvent::ScanStarted { path, total_slices });
+        }
+        let scan_stride = tick_stride(total_slices);
+
+        let file = File::open(to_long_path(path))?;
+        // SAFETY: PAR2 input is read-only by contract. If a writer mutates
+        // the file under us the resulting hashes/encode are simply wrong,
+        // not UB. Same exposure as a BufReader racing with a writer.
+        let mmap_result = unsafe { Mmap::map(&file) };
+
+        let scan_output = match mmap_result {
+            Ok(mmap) => {
+                // Fused arm: scan + encode against the same mmap'd bytes,
+                // in parallel rayon arms. Their work is independent: scan
+                // only reads the bytes; encode reads them and writes into
+                // disjoint recovery_buffers. The kernel page cache lets
+                // the second arm reuse pages the first arm faulted in.
+                let do_encode = rs.is_some() && total_recovery_count > 0;
+                if do_encode {
+                    let rs_ref = rs.as_ref().unwrap();
+                    let recovery = &mut recovery_buffers;
+                    let counter = &encode_progress_counter;
+                    let stride = encode_progress_stride;
+                    let total_inputs = total_input_blocks;
+                    let (scan_out, encode_out) = rayon::join(
+                        || {
+                            scan_via_mmap(
+                                path,
+                                length,
+                                slice_size_usize,
+                                total_slices,
+                                scan_stride,
+                                reporter,
+                                &mmap,
+                            )
+                        },
+                        || -> Result<()> {
+                            encode_file_slices_into_buffers(
+                                &mmap,
+                                length,
+                                slice_size_usize,
+                                total_slices,
+                                rs_ref,
+                                dispatch,
+                                recovery,
+                                counter,
+                                stride,
+                                total_inputs,
+                                reporter,
+                            )
+                        },
+                    );
+                    if let Err(e) = encode_out {
+                        encode_failed = Some(e);
+                    }
+                    scan_out
+                } else {
+                    scan_via_mmap(
+                        path,
+                        length,
+                        slice_size_usize,
+                        total_slices,
+                        scan_stride,
+                        reporter,
+                        &mmap,
+                    )
+                }
+            }
+            Err(_) => {
+                // mmap failed (unusual filesystem). Fall back to the
+                // legacy serial scan + encode pair via the existing
+                // public entry point at the end of this function — but
+                // for the per-file metadata we still need a scan now.
+                // Run scan via the buffered path; encode via the
+                // BufReader path against the same file.
+                return run_create_with_progress_fallback(opts, inputs, &lengths, reporter);
+            }
+        };
+        let (slice_checksums, hash_full, hash16k) = scan_output;
+
+        if let Some(r) = reporter {
+            r.on_event(ProgressEvent::ScanCompleted { path });
+        }
+
+        let file_id = compute_file_id(&hash16k, length, display_name);
+        sources.push(SourceFile {
+            name: display_name.clone(),
+            path: path.clone(),
+            length,
+            hash_full,
+            hash16k,
+            file_id,
+            slice_checksums,
+        });
+    }
+    if let Some(e) = encode_failed {
+        return Err(e);
+    }
+
+    if total_recovery_count > 0 {
+        if let Some(r) = reporter {
+            r.on_event(ProgressEvent::EncodeCompleted { volume_index: 0 });
+        }
+    }
+
+    // From here the rest is identical to run_create_with_progress: build
+    // critical_packets from the now-populated `sources`, write the index
+    // file, then write each volume from `recovery_buffers`.
+    let file_ids: Vec<Md5Hash> = sources.iter().map(|s| s.file_id).collect();
+    let MainPacket {
+        bytes: main_bytes,
+        set_id_hash,
+    } = build_main_packet(slice_size, &file_ids);
+
+    let mut critical_packets: Vec<u8> = Vec::new();
+    critical_packets.extend_from_slice(&main_bytes);
+    for src in &sources {
+        critical_packets.extend_from_slice(&build_file_desc_packet(&set_id_hash, src));
+        critical_packets.extend_from_slice(&build_file_verify_packet(&set_id_hash, src));
+    }
+    critical_packets.extend_from_slice(&build_creator_packet(&set_id_hash));
+    if !opts.comments.is_empty() {
+        critical_packets.extend_from_slice(&build_comment_packets(&set_id_hash, &opts.comments));
+    }
+
+    write_atomic(&opts.output, &critical_packets)?;
+    if let Some(r) = reporter {
+        r.on_event(ProgressEvent::IndexWritten { path: &opts.output });
+    }
+    let mut written = vec![opts.output.clone()];
+
+    if total_recovery_count > 0 {
+        let sizes = resolve_volume_sizes(&opts.volume_scheme, total_recovery_count)?;
+        let mut first_exp: u32 = 0;
+        for count in sizes {
+            let first_exp_u16: u16 = first_exp
+                .try_into()
+                .expect("first_exp fits in u16 because total <= MAX_RECOVERY_BLOCKS");
+            let vol_path = derive_volume_filename(&opts.output, first_exp_u16, count);
+            let r_start = first_exp as usize;
+            let r_end = r_start + count as usize;
+            let vol_bytes = build_volume_packet(
+                &set_id_hash,
+                &critical_packets,
+                &recovery_buffers[r_start..r_end],
+                first_exp_u16,
+            );
+            write_atomic(&vol_path, &vol_bytes)?;
+            if let Some(r) = reporter {
+                r.on_event(ProgressEvent::VolumeWritten { path: &vol_path });
+            }
+            written.push(vol_path);
+            first_exp += count;
+        }
+    }
+
+    Ok(written)
+}
+
+/// Fallback when mmap fails for any source: scan each file via the
+/// `BufReader` path, then call the legacy `run_create_with_progress`.
+/// Slower (no scan/encode overlap, second read of source) but works
+/// everywhere.
+fn run_create_with_progress_fallback(
+    opts: &CreateOptions,
+    inputs: &[(PathBuf, Vec<u8>)],
+    _lengths: &[u64],
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<Vec<PathBuf>> {
+    let mut sources: Vec<SourceFile> = Vec::with_capacity(inputs.len());
+    for (path, display_name) in inputs {
+        let sf =
+            SourceFile::scan_with_progress(path, display_name.clone(), opts.slice_size, reporter)?;
+        sources.push(sf);
+    }
+    run_create_with_progress(opts, &sources, reporter)
+}
+
+/// One file's worth of encode work, against an already-mmap'd source.
+/// Reads each slice as a window into `mmap` (zero-padding the last
+/// partial slice), accumulates into the appropriate columns of the
+/// global `recovery_buffers`, and emits `EncodeProgress` events keyed
+/// on the global input index (so callers see one monotonic progress
+/// stream across multiple files).
+#[allow(clippy::too_many_arguments)]
+fn encode_file_slices_into_buffers(
+    mmap: &[u8],
+    length: u64,
+    slice_size_usize: usize,
+    total_slices: u64,
+    rs: &RsEncoder,
+    dispatch: Dispatch,
+    recovery_buffers: &mut [Vec<u8>],
+    progress_counter: &AtomicU64,
+    progress_stride: u64,
+    total_input_blocks: u64,
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<()> {
+    let recovery_count = recovery_buffers.len();
+    if recovery_count == 0 {
+        return Ok(());
+    }
+
+    let workers = rayon::current_num_threads().max(1);
+    let chunk_len = recovery_count.div_ceil(workers).max(1);
+
+    // Reusable scratch only used for the trailing partial slice (mmap is
+    // read-only so we can't zero-pad in place).
+    let mut tail_buf: Option<Vec<u8>> = None;
+
+    // Snapshot the global input index for the first slice of this file
+    // (== count of slices completed across earlier files). The outer
+    // dispatcher calls this fn sequentially per file, so no other writer
+    // is touching `progress_counter` during this loop.
+    let file_global_offset = progress_counter.load(Ordering::Relaxed) as usize;
+
+    for slice_idx in 0..(total_slices as usize) {
+        let start = slice_idx.saturating_mul(slice_size_usize);
+        let end = std::cmp::min(start.saturating_add(slice_size_usize), length as usize);
+        let slice_ref: &[u8] = if end - start == slice_size_usize {
+            &mmap[start..end]
+        } else {
+            let buf = tail_buf.get_or_insert_with(|| vec![0u8; slice_size_usize]);
+            buf[..end - start].copy_from_slice(&mmap[start..end]);
+            buf[end - start..].fill(0);
+            buf.as_slice()
+        };
+
+        // Global input index for THIS slice within the RS Vandermonde
+        // matrix. file_global_offset + slice_idx is monotonic, stable,
+        // and matches what a single-pass encode over the concatenated
+        // input would compute.
+        let global_input_idx = file_global_offset + slice_idx;
+
+        // Precompute one SIMD lookup table per recovery row for THIS
+        // input slice's column of the RS matrix. Parallelised across
+        // rayon workers — each table build is independent.
+        let coeff_tables: Vec<CoeffSimdTables> = (0..recovery_count)
+            .into_par_iter()
+            .map(|r_idx| {
+                let coeff = rs.coefficient(r_idx, global_input_idx);
+                CoeffSimdTables::new(dispatch, coeff)
+            })
+            .collect();
+
+        let tables_ref: &[CoeffSimdTables] = &coeff_tables;
+        let slice_for_simd: &[u8] = slice_ref;
+        recovery_buffers
+            .par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base = chunk_idx * chunk_len;
+                for (offset, out) in chunk.iter_mut().enumerate() {
+                    let r_idx = base + offset;
+                    gf_mul_xor_with_tables(&tables_ref[r_idx], slice_for_simd, out);
+                }
+            });
+
+        // Bump the global progress counter and (rate-limited) emit a
+        // progress event.
+        let done = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(r) = reporter {
+            if done == total_input_blocks || done % progress_stride == 0 {
+                r.on_event(ProgressEvent::EncodeProgress {
+                    volume_index: 0,
+                    input_block_done: done,
+                    input_blocks: total_input_blocks,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Legacy entrypoint kept so Phase-3-era tests still build. Writes the index
@@ -1335,6 +1722,69 @@ mod tests {
             let bytes_a = std::fs::read(a).unwrap();
             let bytes_b = std::fs::read(b).unwrap();
             assert_eq!(bytes_a, bytes_b, "files differ");
+        }
+    }
+
+    #[test]
+    fn run_create_fused_matches_run_create_with_progress() {
+        // Regression: the fused API must produce byte-identical output to
+        // the legacy scan-then-encode path. Exercise both single-volume
+        // and exponential multi-volume schemes against a payload that
+        // spans multiple slices including a partial last slice that
+        // needs zero-padding.
+        let payload: Vec<u8> = (0..(17 * 1024 + 37))
+            .map(|i| (i as u8).wrapping_mul(101))
+            .collect();
+
+        for (scheme, recovery, slice) in [
+            (VolumeScheme::Single, 4u32, 4_096u64),
+            (VolumeScheme::Exponential, 11u32, 4_096u64),
+            (VolumeScheme::Single, 0u32, 4_096u64), // index-only
+        ] {
+            let dir_legacy = tempdir().unwrap();
+            let dir_fused = tempdir().unwrap();
+            std::fs::write(dir_legacy.path().join("p.bin"), &payload).unwrap();
+            std::fs::write(dir_fused.path().join("p.bin"), &payload).unwrap();
+            let src = SourceFile::scan(&dir_legacy.path().join("p.bin"), b"p.bin".to_vec(), slice)
+                .unwrap();
+
+            let opts_legacy = CreateOptions {
+                output: dir_legacy.path().join("recovery.par2"),
+                slice_size: slice,
+                recovery_block_count: recovery,
+                volume_scheme: scheme.clone(),
+                comments: Vec::new(),
+            };
+            let opts_fused = CreateOptions {
+                output: dir_fused.path().join("recovery.par2"),
+                slice_size: slice,
+                recovery_block_count: recovery,
+                volume_scheme: scheme.clone(),
+                comments: Vec::new(),
+            };
+
+            let files_legacy = run_create(&opts_legacy, &[src]).unwrap();
+            let files_fused = run_create_fused(
+                &opts_fused,
+                &[(dir_fused.path().join("p.bin"), b"p.bin".to_vec())],
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                files_legacy.len(),
+                files_fused.len(),
+                "scheme {scheme:?} / recovery {recovery}"
+            );
+            for (a, b) in files_legacy.iter().zip(files_fused.iter()) {
+                let bytes_a = std::fs::read(a).unwrap();
+                let bytes_b = std::fs::read(b).unwrap();
+                assert_eq!(
+                    bytes_a,
+                    bytes_b,
+                    "fused != legacy for scheme {scheme:?} / recovery {recovery}: file {}",
+                    a.display()
+                );
+            }
         }
     }
 }

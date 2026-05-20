@@ -142,7 +142,7 @@ impl SourceFile {
 /// rayon task via `rayon::join`. MD5 is inherently sequential per-stream, so
 /// we can't parallelise within those two hashes — but we can overlap them with
 /// the per-slice work.
-fn scan_via_mmap(
+pub(crate) fn scan_via_mmap(
     path: &Path,
     length: u64,
     slice_size_usize: usize,
