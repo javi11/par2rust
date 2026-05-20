@@ -9,6 +9,11 @@ license = "GPL-2.0-or-later"
 [features]
 default = ["cli"]
 cli = ["dep:clap", "dep:indicatif", "dep:walkdir"]
+# Replace the pure-Rust md-5 backend with OpenSSL's hand-tuned MD5
+# (ARM asm on Apple Silicon, AVX/AVX-512 on x86) — typically 2-3× the
+# throughput of `md-5` on aarch64. Adds a native dep; consumers who
+# can't afford the OpenSSL build keep the default `md-5` path.
+fast-md5 = ["dep:openssl"]
 
 [dependencies]
 md-5 = "0.10"
@@ -20,6 +25,7 @@ thiserror = "1"
 cpufeatures = "0.2"
 rayon = "1.10"
 memmap2 = "0.9"
+openssl = { version = "0.10", optional = true, features = ["vendored"] }
 
 [dev-dependencies]
 tempfile = "3"

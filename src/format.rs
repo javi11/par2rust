@@ -1,4 +1,4 @@
-use md5::{Digest, Md5};
+use crate::md5_impl;
 
 pub const PACKET_MAGIC: [u8; 8] = *b"PAR2\0PKT";
 pub const HEADER_SIZE: usize = 64;
@@ -15,9 +15,7 @@ pub const TYPE_COMMENT_UNICODE: [u8; 16] = *b"PAR 2.0\0CommUni\0";
 pub type Md5Hash = [u8; 16];
 
 pub fn md5_of(bytes: &[u8]) -> Md5Hash {
-    let mut h = Md5::new();
-    h.update(bytes);
-    h.finalize().into()
+    md5_impl::digest(bytes)
 }
 
 /// Round `n` up to the next multiple of 4. PAR2 requires every packet body length

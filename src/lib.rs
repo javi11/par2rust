@@ -44,6 +44,7 @@ pub mod error;
 pub mod format;
 pub mod galois;
 pub mod galois_simd;
+pub(crate) mod md5_impl;
 pub mod packet;
 pub mod progress;
 pub mod reedsolomon;

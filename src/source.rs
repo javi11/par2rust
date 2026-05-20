@@ -3,12 +3,12 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use md5::{Digest, Md5};
 use memmap2::Mmap;
 use rayon::prelude::*;
 
 use crate::error::{Par2Error, Result};
 use crate::format::{md5_of, Md5Hash};
+use crate::md5_impl::{self, Md5Ctx};
 use crate::progress::{tick_stride, ProgressEvent, ProgressReporter};
 
 /// Length of the "first chunk" hashed into `hash16k`. The PAR2 spec hard-codes
@@ -168,7 +168,7 @@ pub(crate) fn scan_via_mmap(
                 let cksum = if slice.len() == slice_size_usize {
                     // Common case: full slice → hash the mmap window directly.
                     SliceChecksum {
-                        md5: Md5::digest(slice).into(),
+                        md5: md5_impl::digest(slice),
                         crc32: crc32fast::hash(slice),
                     }
                 } else {
@@ -177,7 +177,7 @@ pub(crate) fn scan_via_mmap(
                     let mut buf = vec![0u8; slice_size_usize];
                     buf[..slice.len()].copy_from_slice(slice);
                     SliceChecksum {
-                        md5: Md5::digest(&buf).into(),
+                        md5: md5_impl::digest(&buf),
                         crc32: crc32fast::hash(&buf),
                     }
                 };
@@ -221,9 +221,9 @@ pub(crate) fn scan_via_mmap(
     };
 
     let file_hashes = || {
-        let hash_full: Md5Hash = Md5::digest(bytes).into();
+        let hash_full: Md5Hash = md5_impl::digest(bytes);
         let h16k_end = std::cmp::min(length as usize, HASH16K_LEN);
-        let hash16k: Md5Hash = Md5::digest(&bytes[..h16k_end]).into();
+        let hash16k: Md5Hash = md5_impl::digest(&bytes[..h16k_end]);
         (hash_full, hash16k)
     };
 
@@ -246,8 +246,8 @@ fn scan_via_reader(
     let _ = length; // kept for symmetry with mmap path; not needed here
     let mut reader = BufReader::with_capacity(FALLBACK_READ_CAPACITY, file);
 
-    let mut hash_full_ctx = Md5::new();
-    let mut hash16k_ctx = Md5::new();
+    let mut hash_full_ctx = Md5Ctx::new();
+    let mut hash16k_ctx = Md5Ctx::new();
     let mut bytes_into_16k: usize = 0;
 
     let mut slice_buf = vec![0u8; slice_size_usize];
@@ -271,7 +271,7 @@ fn scan_via_reader(
             slice_buf[filled..].fill(0);
         }
 
-        let md5: Md5Hash = Md5::digest(&slice_buf[..]).into();
+        let md5: Md5Hash = md5_impl::digest(&slice_buf[..]);
         let crc32 = crc32fast::hash(&slice_buf[..]);
         slice_checksums.push(SliceChecksum { md5, crc32 });
 
@@ -292,8 +292,8 @@ fn scan_via_reader(
         }
     }
 
-    let hash_full: Md5Hash = hash_full_ctx.finalize().into();
-    let hash16k: Md5Hash = hash16k_ctx.finalize().into();
+    let hash_full: Md5Hash = hash_full_ctx.finalize();
+    let hash16k: Md5Hash = hash16k_ctx.finalize();
     Ok((slice_checksums, hash_full, hash16k))
 }
 
