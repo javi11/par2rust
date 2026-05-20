@@ -23,16 +23,22 @@ enum SourceReader {
 impl SourceReader {
     fn open(path: &Path) -> std::io::Result<Self> {
         let f = File::open(path)?;
-        // SAFETY: PAR2 input is read-only by contract. If the user mutates the
-        // file while we read it the resulting recovery data is simply wrong —
-        // not UB in the Rust sense. Same exposure as the BufReader fallback.
-        match unsafe { Mmap::map(&f) } {
-            Ok(m) => Ok(SourceReader::Mmap(m)),
-            Err(_) => Ok(SourceReader::Buffered(BufReader::with_capacity(
-                FALLBACK_READ_CAPACITY,
-                f,
-            ))),
+        // Diagnostic escape hatch: when PAR2RUST_DISABLE_MMAP_ENCODE is set
+        // (any value), skip the mmap fast path and use the 4 MiB BufReader
+        // fallback. Lets callers A/B the encode-side mmap without rebuilding.
+        let mmap_disabled = std::env::var_os("PAR2RUST_DISABLE_MMAP_ENCODE").is_some();
+        if !mmap_disabled {
+            // SAFETY: PAR2 input is read-only by contract. If the user mutates
+            // the file while we read it the resulting recovery data is simply
+            // wrong — not UB in the Rust sense. Same exposure as BufReader.
+            if let Ok(m) = unsafe { Mmap::map(&f) } {
+                return Ok(SourceReader::Mmap(m));
+            }
         }
+        Ok(SourceReader::Buffered(BufReader::with_capacity(
+            FALLBACK_READ_CAPACITY,
+            f,
+        )))
     }
 
     /// Fill `slice_buf` with the bytes of slice `slice_idx`, zero-padding any
