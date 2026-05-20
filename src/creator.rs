@@ -3,7 +3,67 @@ use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
+use memmap2::Mmap;
 use rayon::prelude::*;
+
+/// Fallback BufReader capacity for the encode read path on platforms where
+/// mmap is unavailable. Must match `source::FALLBACK_READ_CAPACITY` in spirit:
+/// 4 MiB keeps cold sequential reads close to the disk ceiling.
+const FALLBACK_READ_CAPACITY: usize = 4 * 1024 * 1024;
+
+/// Source-file reader used by the encode loop. Prefers mmap so the OS page
+/// cache absorbs the inevitable re-read after the scan phase; falls back to a
+/// 4 MiB BufReader on platforms / file systems where mmap fails (e.g. some
+/// Windows network shares).
+enum SourceReader {
+    Mmap(Mmap),
+    Buffered(BufReader<File>),
+}
+
+impl SourceReader {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let f = File::open(path)?;
+        // SAFETY: PAR2 input is read-only by contract. If the user mutates the
+        // file while we read it the resulting recovery data is simply wrong —
+        // not UB in the Rust sense. Same exposure as the BufReader fallback.
+        match unsafe { Mmap::map(&f) } {
+            Ok(m) => Ok(SourceReader::Mmap(m)),
+            Err(_) => Ok(SourceReader::Buffered(BufReader::with_capacity(
+                FALLBACK_READ_CAPACITY,
+                f,
+            ))),
+        }
+    }
+
+    /// Fill `slice_buf` with the bytes of slice `slice_idx`, zero-padding any
+    /// tail that runs past EOF (PAR2 spec: trailing partial slice is zero-padded
+    /// before checksumming / encoding).
+    fn read_slice(&mut self, slice_idx: usize, slice_buf: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            SourceReader::Mmap(m) => {
+                let start = slice_idx.saturating_mul(slice_buf.len());
+                let end = std::cmp::min(start.saturating_add(slice_buf.len()), m.len());
+                let src = if start < m.len() {
+                    &m[start..end]
+                } else {
+                    &[][..]
+                };
+                slice_buf[..src.len()].copy_from_slice(src);
+                if src.len() < slice_buf.len() {
+                    slice_buf[src.len()..].fill(0);
+                }
+                Ok(())
+            }
+            SourceReader::Buffered(r) => {
+                let filled = read_full(r, slice_buf)?;
+                if filled < slice_buf.len() {
+                    slice_buf[filled..].fill(0);
+                }
+                Ok(())
+            }
+        }
+    }
+}
 
 use crate::error::{Par2Error, Result};
 use crate::format::Md5Hash;
@@ -378,32 +438,24 @@ fn build_volume_file(
         .collect();
 
     // 4. Stream input blocks one slice at a time, accumulating into all
-    //    recovery buffers. Each file is opened once and read strictly
-    //    sequentially — `input_blocks` iterates slice_idx 0..N contiguously
-    //    within each file, so no seek is needed.
+    //    recovery buffers. Each file is opened (and mmap'd) once. With mmap
+    //    the kernel page cache typically still has the bytes warm from the
+    //    scan pass, so this loop pays no second physical read.
     let mut slice_buf = vec![0u8; slice_size_usize];
-    let mut current_file: Option<(usize, BufReader<File>)> = None;
-    // Reusable scratch for the per-slice precomputed dispatch tables — sized
-    // once at `recovery_count` and overwritten in place per slice to avoid
-    // re-allocating `Vec<CoeffSimdTables>` on every input block.
+    let mut current_file: Option<(usize, SourceReader)> = None;
     let workers = rayon::current_num_threads().max(1);
     let chunk_len = recovery_count.div_ceil(workers).max(1);
 
-    for (input_idx, (file_idx, _slice_idx)) in input_blocks.iter().enumerate() {
-        // Open the reader for a new file. Within a file, slices are read in
-        // order and we never seek — the BufReader's 64 KiB readahead keeps
-        // throughput close to the disk's sequential ceiling.
+    for (input_idx, (file_idx, slice_idx)) in input_blocks.iter().enumerate() {
+        // (Re)open the reader on file boundaries.
         let switched_file = !matches!(&current_file, Some((idx, _)) if *idx == *file_idx);
         if switched_file {
-            let f = File::open(to_long_path(&sources[*file_idx].path))?;
-            current_file = Some((*file_idx, BufReader::with_capacity(1 << 16, f)));
+            let reader = SourceReader::open(&to_long_path(&sources[*file_idx].path))?;
+            current_file = Some((*file_idx, reader));
         }
         let reader = &mut current_file.as_mut().unwrap().1;
 
-        let filled = read_full(reader, &mut slice_buf)?;
-        if filled < slice_buf.len() {
-            slice_buf[filled..].fill(0);
-        }
+        reader.read_slice(*slice_idx as usize, &mut slice_buf)?;
 
         // Precompute one SIMD lookup table per recovery row for THIS input
         // slice's column of the RS matrix. Previously the table was rebuilt

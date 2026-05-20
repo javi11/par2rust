@@ -1,8 +1,11 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use md5::{Digest, Md5};
+use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::error::{Par2Error, Result};
 use crate::format::{md5_of, Md5Hash};
@@ -12,6 +15,11 @@ use crate::progress::{tick_stride, ProgressEvent, ProgressReporter};
 /// this to 16 384 bytes — for files smaller than that, only the available bytes
 /// are hashed.
 pub const HASH16K_LEN: usize = 16 * 1024;
+
+/// Fallback BufReader capacity when the file cannot be memory-mapped (e.g.
+/// some Windows network shares or unusual file systems). 4 MiB keeps the
+/// sequential read close to disk throughput without spending much RAM.
+const FALLBACK_READ_CAPACITY: usize = 4 * 1024 * 1024;
 
 /// One slice of a source file. Slices are fixed-size (== `slice_size`) except
 /// possibly the trailing slice of a file, which is zero-padded up to `slice_size`
@@ -66,6 +74,9 @@ impl SourceFile {
             return Err(Par2Error::EmptyFile(path.to_path_buf()));
         }
 
+        let slice_size_usize: usize = slice_size
+            .try_into()
+            .map_err(|_| Par2Error::InvalidSliceSize(slice_size))?;
         let total_slices = length.div_ceil(slice_size);
         if let Some(r) = reporter {
             r.on_event(ProgressEvent::ScanStarted { path, total_slices });
@@ -73,67 +84,40 @@ impl SourceFile {
         let stride = tick_stride(total_slices);
 
         let file = File::open(path)?;
-        let mut reader = BufReader::with_capacity(1 << 16, file);
 
-        let mut hash_full_ctx = Md5::new();
-        let mut hash16k_ctx = Md5::new();
-        let mut bytes_into_16k: usize = 0;
+        // Try mmap first. The per-slice MD5+CRC32 work parallelises perfectly
+        // over `mmap.par_chunks(slice_size)`, and the kernel page cache lets
+        // the subsequent encode pass re-read the same bytes without a second
+        // physical I/O. Fall back to a streamed BufReader path on platforms
+        // / file systems where mmap is unavailable.
+        //
+        // SAFETY: callers must not concurrently write the file. PAR2 input is
+        // read-only by definition; if a writer mutates the file under us the
+        // resulting hashes are simply wrong (same outcome as a BufReader that
+        // races with a writer), not memory-unsafe in the Rust sense.
+        let mmap_result = unsafe { Mmap::map(&file) };
 
-        let slice_size_usize: usize = slice_size
-            .try_into()
-            .map_err(|_| Par2Error::InvalidSliceSize(slice_size))?;
-        let mut slice_buf = vec![0u8; slice_size_usize];
-        let mut slice_checksums: Vec<SliceChecksum> = Vec::new();
+        let (slice_checksums, hash_full, hash16k) = match mmap_result {
+            Ok(mmap) => scan_via_mmap(
+                path,
+                length,
+                slice_size_usize,
+                total_slices,
+                stride,
+                reporter,
+                &mmap,
+            ),
+            Err(_) => scan_via_reader(
+                path,
+                length,
+                slice_size_usize,
+                total_slices,
+                stride,
+                reporter,
+                file,
+            )?,
+        };
 
-        loop {
-            let filled = read_full(&mut reader, &mut slice_buf)?;
-            if filled == 0 {
-                break;
-            }
-
-            // Feed the partial-or-full slice into the file-wide hashes first.
-            hash_full_ctx.update(&slice_buf[..filled]);
-            if bytes_into_16k < HASH16K_LEN {
-                let take = std::cmp::min(HASH16K_LEN - bytes_into_16k, filled);
-                hash16k_ctx.update(&slice_buf[..take]);
-                bytes_into_16k += take;
-            }
-
-            // For per-slice checksums, the trailing partial slice is zero-padded.
-            let was_partial = filled < slice_buf.len();
-            if was_partial {
-                slice_buf[filled..].fill(0);
-            }
-
-            let mut md5_ctx = Md5::new();
-            md5_ctx.update(&slice_buf[..]);
-            let md5: Md5Hash = md5_ctx.finalize().into();
-
-            let mut crc_ctx = crc32fast::Hasher::new();
-            crc_ctx.update(&slice_buf[..]);
-            let crc32 = crc_ctx.finalize();
-
-            slice_checksums.push(SliceChecksum { md5, crc32 });
-
-            if let Some(r) = reporter {
-                let done = slice_checksums.len() as u64;
-                let is_last = was_partial || done == total_slices;
-                if is_last || done % stride == 0 {
-                    r.on_event(ProgressEvent::ScanProgress {
-                        path,
-                        slices_done: done,
-                        total_slices,
-                    });
-                }
-            }
-
-            if was_partial {
-                break;
-            }
-        }
-
-        let hash_full: Md5Hash = hash_full_ctx.finalize().into();
-        let hash16k: Md5Hash = hash16k_ctx.finalize().into();
         let file_id = compute_file_id(&hash16k, length, &display_name);
 
         if let Some(r) = reporter {
@@ -150,6 +134,167 @@ impl SourceFile {
             slice_checksums,
         })
     }
+}
+
+/// Parallel mmap-backed scan. Per-slice MD5/CRC32 fan out across rayon
+/// workers (`par_chunks` hands each thread a contiguous, disjoint slot of the
+/// mmap), while the file-wide `hash_full` and `hash16k` run on a separate
+/// rayon task via `rayon::join`. MD5 is inherently sequential per-stream, so
+/// we can't parallelise within those two hashes — but we can overlap them with
+/// the per-slice work.
+fn scan_via_mmap(
+    path: &Path,
+    length: u64,
+    slice_size_usize: usize,
+    total_slices: u64,
+    stride: u64,
+    reporter: Option<&dyn ProgressReporter>,
+    mmap: &Mmap,
+) -> (Vec<SliceChecksum>, Md5Hash, Md5Hash) {
+    let bytes: &[u8] = &mmap[..];
+
+    let per_slice = || {
+        // `done` counts completed slices across all rayon workers.
+        // `last_emitted` gates reporter callbacks so they remain monotonic
+        // even though `done` is incremented out-of-order across threads
+        // (without this, a faster worker can publish a higher count, then
+        // a slower one publishes a lower one — confusing any consumer that
+        // assumes monotonic progress).
+        let done = AtomicU64::new(0);
+        let last_emitted = AtomicU64::new(0);
+        bytes
+            .par_chunks(slice_size_usize)
+            .map(|slice| {
+                let cksum = if slice.len() == slice_size_usize {
+                    // Common case: full slice → hash the mmap window directly.
+                    SliceChecksum {
+                        md5: Md5::digest(slice).into(),
+                        crc32: crc32fast::hash(slice),
+                    }
+                } else {
+                    // Trailing partial slice: zero-pad in a thread-local buffer
+                    // (cannot mutate the read-only mmap).
+                    let mut buf = vec![0u8; slice_size_usize];
+                    buf[..slice.len()].copy_from_slice(slice);
+                    SliceChecksum {
+                        md5: Md5::digest(&buf).into(),
+                        crc32: crc32fast::hash(&buf),
+                    }
+                };
+
+                if let Some(r) = reporter {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let is_last = d == total_slices;
+                    if is_last || d % stride == 0 {
+                        // Only emit if `d` is strictly newer than whatever a
+                        // sibling worker already published. CAS-loop on
+                        // `last_emitted` so concurrent ticks fold into one
+                        // monotonic event stream.
+                        let mut prev = last_emitted.load(Ordering::Relaxed);
+                        loop {
+                            if d <= prev {
+                                break;
+                            }
+                            match last_emitted.compare_exchange_weak(
+                                prev,
+                                d,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => {
+                                    r.on_event(ProgressEvent::ScanProgress {
+                                        path,
+                                        slices_done: d,
+                                        total_slices,
+                                    });
+                                    break;
+                                }
+                                Err(actual) => prev = actual,
+                            }
+                        }
+                    }
+                }
+
+                cksum
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let file_hashes = || {
+        let hash_full: Md5Hash = Md5::digest(bytes).into();
+        let h16k_end = std::cmp::min(length as usize, HASH16K_LEN);
+        let hash16k: Md5Hash = Md5::digest(&bytes[..h16k_end]).into();
+        (hash_full, hash16k)
+    };
+
+    let (slice_checksums, (hash_full, hash16k)) = rayon::join(per_slice, file_hashes);
+    (slice_checksums, hash_full, hash16k)
+}
+
+/// Serial BufReader fallback for platforms where mmap fails. Streams the file
+/// once with a 4 MiB buffer (vs the previous 64 KiB) so cold reads stay close
+/// to the disk's sequential ceiling.
+fn scan_via_reader(
+    path: &Path,
+    length: u64,
+    slice_size_usize: usize,
+    total_slices: u64,
+    stride: u64,
+    reporter: Option<&dyn ProgressReporter>,
+    file: File,
+) -> Result<(Vec<SliceChecksum>, Md5Hash, Md5Hash)> {
+    let _ = length; // kept for symmetry with mmap path; not needed here
+    let mut reader = BufReader::with_capacity(FALLBACK_READ_CAPACITY, file);
+
+    let mut hash_full_ctx = Md5::new();
+    let mut hash16k_ctx = Md5::new();
+    let mut bytes_into_16k: usize = 0;
+
+    let mut slice_buf = vec![0u8; slice_size_usize];
+    let mut slice_checksums: Vec<SliceChecksum> = Vec::new();
+
+    loop {
+        let filled = read_full(&mut reader, &mut slice_buf)?;
+        if filled == 0 {
+            break;
+        }
+
+        hash_full_ctx.update(&slice_buf[..filled]);
+        if bytes_into_16k < HASH16K_LEN {
+            let take = std::cmp::min(HASH16K_LEN - bytes_into_16k, filled);
+            hash16k_ctx.update(&slice_buf[..take]);
+            bytes_into_16k += take;
+        }
+
+        let was_partial = filled < slice_buf.len();
+        if was_partial {
+            slice_buf[filled..].fill(0);
+        }
+
+        let md5: Md5Hash = Md5::digest(&slice_buf[..]).into();
+        let crc32 = crc32fast::hash(&slice_buf[..]);
+        slice_checksums.push(SliceChecksum { md5, crc32 });
+
+        if let Some(r) = reporter {
+            let done = slice_checksums.len() as u64;
+            let is_last = was_partial || done == total_slices;
+            if is_last || done % stride == 0 {
+                r.on_event(ProgressEvent::ScanProgress {
+                    path,
+                    slices_done: done,
+                    total_slices,
+                });
+            }
+        }
+
+        if was_partial {
+            break;
+        }
+    }
+
+    let hash_full: Md5Hash = hash_full_ctx.finalize().into();
+    let hash16k: Md5Hash = hash16k_ctx.finalize().into();
+    Ok((slice_checksums, hash_full, hash16k))
 }
 
 /// `file_id = MD5( hash16k ‖ length_le8 ‖ name_bytes )`. The name is fed in
@@ -294,5 +439,33 @@ mod tests {
         let mut last = vec![16u8];
         last.extend(std::iter::repeat(0).take(7));
         assert_eq!(sf.slice_checksums[2].md5, md5_of(&last));
+    }
+
+    #[test]
+    fn parallel_scan_matches_serial_for_many_slices() {
+        // Regression for the par_chunks fan-out: ensure ordering is preserved
+        // even when slice count is large enough to fan across multiple rayon
+        // workers. 4096 slices of 16 bytes each, deterministic content.
+        let mut data = vec![0u8; 4096 * 16];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i.wrapping_mul(0x9E37) >> 5) & 0xff) as u8;
+        }
+        let f = write_temp(&data);
+        let sf = SourceFile::scan(f.path(), b"x".to_vec(), 16).unwrap();
+        assert_eq!(sf.slice_checksums.len(), 4096);
+        // Spot-check that slice i lines up with bytes [16*i .. 16*i+16].
+        for &i in &[0usize, 1, 7, 1023, 4095] {
+            let start = i * 16;
+            assert_eq!(
+                sf.slice_checksums[i].md5,
+                md5_of(&data[start..start + 16]),
+                "mismatch at slice {i}"
+            );
+            assert_eq!(
+                sf.slice_checksums[i].crc32,
+                crc32fast::hash(&data[start..start + 16]),
+                "crc mismatch at slice {i}"
+            );
+        }
     }
 }
