@@ -72,6 +72,6 @@ mod tests {
         let src = fake_with_slices(0);
         let pkt = build_file_verify_packet(&[0u8; 16], &src);
         assert_eq!(pkt.len(), HEADER_SIZE + 16);
-        assert!(pkt.len() % 4 == 0);
+        assert!(pkt.len().is_multiple_of(4));
     }
 }

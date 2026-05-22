@@ -195,6 +195,35 @@ buffers (≈105 MB live) the inner loop becomes memory-bandwidth-bound rather
 than compute-bound. Tune `slice-size` / `recovery-count` to fit your CPU's
 shared cache for best results.
 
+### GF(2¹⁶) kernel throughput
+
+The Reed-Solomon inner loop dispatches to the fastest GF kernel available
+on the host CPU. Runtime detection picks one of:
+
+| Dispatch       | Hardware required           | Inner loop                                                |
+|----------------|-----------------------------|-----------------------------------------------------------|
+| `Neon`         | aarch64 (base ISA)          | `vqtbl1q_u8` nibble lookup, 32 bytes/iter                 |
+| `Gfni`         | x86_64 with `gfni + ssse3`  | `GF2P8AFFINEQB` affine, 32 bytes/iter (~1.5–2× SSSE3)     |
+| `Ssse3`        | x86_64 with `ssse3`         | `PSHUFB` nibble lookup, 32 bytes/iter                     |
+| `TableScalar`  | any                         | Two 256-entry u16 lookup tables per coefficient           |
+| `Scalar`       | any                         | Per-symbol log/antilog (correctness reference)            |
+
+Bench harness: `cargo bench --bench gf_kernel`. Measures wall-clock
+throughput on a 1 MiB L2-resident buffer; the dispatch name in the
+group label tells you which kernel ran. Indicative numbers:
+
+| Kernel          | Hardware                  | 1 MiB throughput |
+|-----------------|---------------------------|------------------|
+| `Neon`          | Apple M4 (10 cores)       | ~20.8 GiB/s      |
+| `Gfni` / `Ssse3`| (run the bench on your x86 box to populate)              |
+
+`Dispatch::Gfni` is preferred over `Ssse3` when both are available; the
+two share an identical 32-bytes-per-iter data layout and differ only in
+the per-iter math (4× `GF2P8AFFINEQB` + 2× `XOR` vs 8× `PSHUFB` + 6×
+`XOR`). AVX2 (256-bit) and AVX-512 (512-bit) GFNI variants are planned
+follow-ups; the 128-bit MVP is the lowest-risk introduction because
+every shuffle stays within a single 16-byte lane.
+
 ## Testing
 
 ```bash

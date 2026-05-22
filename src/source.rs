@@ -437,7 +437,7 @@ mod tests {
 
         // Last slice content = data[16..17] then 7 zero bytes.
         let mut last = vec![16u8];
-        last.extend(std::iter::repeat(0).take(7));
+        last.extend(std::iter::repeat_n(0, 7));
         assert_eq!(sf.slice_checksums[2].md5, md5_of(&last));
     }
 
