@@ -31,7 +31,10 @@ pub fn round_up_4(n: usize) -> usize {
 /// This is the single place packets are framed; every packet writer composes its
 /// body first, then hands the bytes here.
 pub fn build_packet(set_id_hash: &Md5Hash, type_tag: &[u8; 16], body: &[u8]) -> Vec<u8> {
-    debug_assert!(body.len() % 4 == 0, "packet body must be 4-byte aligned");
+    debug_assert!(
+        body.len().is_multiple_of(4),
+        "packet body must be 4-byte aligned"
+    );
     let packet_len = HEADER_SIZE + body.len();
 
     let mut hash_input = Vec::with_capacity(32 + body.len());
