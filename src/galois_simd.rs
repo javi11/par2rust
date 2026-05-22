@@ -403,6 +403,15 @@ mod x86 {
 #[cfg(target_arch = "x86_64")]
 pub use x86::{gf_mul_xor_ssse3, X86Tables};
 
+// --------------------------------------------------------------------------
+// GFNI (GF2P8AFFINEQB) affine-matrix derivation
+// --------------------------------------------------------------------------
+//
+// Task 1 of the GFNI plan: derive the four 8x8 GF(2) sub-matrices that
+// represent multiplication by a fixed GF(2^16) coefficient. Pure scalar;
+// the SIMD kernel built on top of these matrices lands in Task 2.
+mod gfni;
+
 #[cfg(target_arch = "x86_64")]
 fn gf_mul_xor_table_scalar_from_x86_tables(nt: &X86Tables, input: &[u8], output: &mut [u8]) {
     for k in 0..(input.len() / 2) {
@@ -615,6 +624,33 @@ mod tests {
             for &len in &lengths {
                 let input = deterministic((coeff as u64).rotate_left(13) ^ len as u64, len);
                 check_against_scalar(coeff, &input, Dispatch::Neon);
+            }
+        }
+    }
+
+    #[test]
+    fn gfni_affine_matrices_round_trip_a_single_symbol() {
+        use crate::galois_simd::gfni::GfniTables;
+        // For every coefficient c, the derived matrices should reproduce the
+        // scalar log-table result for every 16-bit input symbol.
+        let coeffs = [
+            0x0002u16, 0x00FF, 0x0100, 0x1234, 0x8000, 0xABCD, 0xFFFE, 0xFFFF,
+        ];
+        for &c in &coeffs {
+            let t = GfniTables::from_coeff(c);
+            for sym in 0u32..=0xFFFF {
+                let lo = (sym & 0xFF) as u8;
+                let hi = (sym >> 8) as u8;
+                let (out_lo, out_hi) = t.apply_scalar(lo, hi);
+                let mut scalar_out = [0u8; 2];
+                super::gf_mul_xor_scalar(c, &(sym as u16).to_le_bytes(), &mut scalar_out);
+                assert_eq!(
+                    (out_lo, out_hi),
+                    (scalar_out[0], scalar_out[1]),
+                    "coeff=0x{:04X} sym=0x{:04X}: GFNI matrix path diverged",
+                    c,
+                    sym,
+                );
             }
         }
     }
