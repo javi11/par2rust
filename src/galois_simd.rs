@@ -447,6 +447,12 @@ pub enum Dispatch {
     /// nibble-lookup math with 4× affine ops.
     #[cfg(target_arch = "x86_64")]
     Gfni,
+    /// GFNI + AVX-512BW — 512-bit body using `VGF2P8AFFINEQB` on ZMM.
+    /// Preferred over `Gfni` when AVX-512BW is also available; processes
+    /// 128 bytes (64 GF symbols) per iter vs the 128-bit kernel's 32
+    /// bytes (16 symbols).
+    #[cfg(target_arch = "x86_64")]
+    GfniAvx512,
 }
 
 /// Select the fastest available SIMD path on this machine. Called once at
@@ -459,9 +465,15 @@ pub fn detect_dispatch() -> Dispatch {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // GFNI implies SSSE3 in practice on every shipping part, but
-        // gate explicitly so the SIMD body's PSHUFB-based deinterleave
-        // (`#[target_feature(enable = "gfni,ssse3")]`) is sound.
+        // Prefer the widest GFNI variant available. Each gate matches
+        // the corresponding kernel's `#[target_feature]` requirement
+        // exactly so unsafe entry is sound.
+        if std::is_x86_feature_detected!("gfni")
+            && std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+        {
+            return Dispatch::GfniAvx512;
+        }
         if std::is_x86_feature_detected!("gfni") && std::is_x86_feature_detected!("ssse3") {
             return Dispatch::Gfni;
         }
@@ -504,6 +516,11 @@ pub enum CoeffSimdTables {
     /// the smallest per-coefficient state of any SIMD variant.
     #[cfg(target_arch = "x86_64")]
     Gfni(gfni::GfniTables),
+    /// GFNI affine matrices for the AVX-512 kernel. Identical payload
+    /// to [`CoeffSimdTables::Gfni`]; the variant tag selects the
+    /// wider kernel at dispatch time.
+    #[cfg(target_arch = "x86_64")]
+    GfniAvx512(gfni::GfniTables),
 }
 
 impl CoeffSimdTables {
@@ -530,6 +547,10 @@ impl CoeffSimdTables {
             }
             #[cfg(target_arch = "x86_64")]
             Dispatch::Gfni => CoeffSimdTables::Gfni(gfni::GfniTables::from_coeff(coeff)),
+            #[cfg(target_arch = "x86_64")]
+            Dispatch::GfniAvx512 => {
+                CoeffSimdTables::GfniAvx512(gfni::GfniTables::from_coeff(coeff))
+            }
         }
     }
 }
@@ -567,6 +588,13 @@ pub fn gf_mul_xor_with_tables(tables: &CoeffSimdTables, input: &[u8], output: &m
             // both `gfni` and `ssse3` at runtime — matching the kernel's
             // `#[target_feature(enable = "gfni,ssse3")]`.
             unsafe { gfni::gf_mul_xor_gfni(t, input, output) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        CoeffSimdTables::GfniAvx512(t) => {
+            // SAFETY: GfniAvx512 is only constructed when `detect_dispatch`
+            // saw `gfni`, `avx512f`, and `avx512bw` at runtime — matching
+            // the kernel's `#[target_feature(enable = "gfni,avx512f,avx512bw")]`.
+            unsafe { gfni::gf_mul_xor_gfni_avx512(t, input, output) };
         }
     }
 }
@@ -694,6 +722,33 @@ mod tests {
             for &len in &lengths {
                 let input = deterministic((coeff as u64).rotate_left(7) ^ len as u64, len);
                 check_against_scalar(coeff, &input, Dispatch::Gfni);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn gfni_avx512_matches_scalar_when_available() {
+        if !std::is_x86_feature_detected!("gfni")
+            || !std::is_x86_feature_detected!("avx512f")
+            || !std::is_x86_feature_detected!("avx512bw")
+        {
+            eprintln!("skipping: GFNI / AVX-512BW not available on this CPU");
+            return;
+        }
+        let coeffs = [0x0002u16, 0x00FF, 0x1234, 0xABCD, 0xFFFE, 0xFFFF];
+        // Cover the full SIMD body (multiples of 128), the 128-bit
+        // fallback inside the tail (32..127), and the scalar tail
+        // (< 32). The interesting lengths are around the body
+        // boundaries — 126 (no body iter), 128 (one body iter),
+        // 130 (one body + 2-byte scalar tail), 256 (two body iters).
+        let lengths = [
+            2usize, 4, 30, 32, 64, 126, 128, 130, 160, 254, 256, 258, 1024, 4096, 4098,
+        ];
+        for &coeff in &coeffs {
+            for &len in &lengths {
+                let input = deterministic((coeff as u64).rotate_left(11) ^ len as u64, len);
+                check_against_scalar(coeff, &input, Dispatch::GfniAvx512);
             }
         }
     }

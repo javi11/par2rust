@@ -136,16 +136,25 @@ fn affine_apply(mat: u64, x: u8) -> u8 {
 }
 
 // --------------------------------------------------------------------------
-// 128-bit GFNI multiply-XOR (x86_64 only)
+// GFNI multiply-XOR (x86_64 only)
 // --------------------------------------------------------------------------
 //
-// MVP width is 128-bit / 16 symbols per iter, matching the existing SSSE3
-// path's data layout exactly. The win over SSSE3 comes from replacing the
-// 8× `PSHUFB` nibble lookups + 6× `XOR` per iter with 4× `GF2P8AFFINEQB`
-// + 2× `XOR` — typically ~1.5–2× per-iter speedup on Tremont, Gracemont,
-// and any GFNI part. Wider AVX2/AVX-512 variants are a follow-up; the
-// 128-bit body is the lowest-risk introduction because every shuffle
-// stays within a single 16-byte lane.
+// Two kernels share the same per-coefficient `GfniTables` payload and
+// differ only in vector width:
+//
+//   • `gf_mul_xor_gfni`        — 128-bit / 16 symbols per iter (XMM).
+//     Required floor: `gfni + ssse3`. Used on Tremont, Gracemont, and
+//     any GFNI part without AVX-512.
+//   • `gf_mul_xor_gfni_avx512` — 512-bit / 64 symbols per iter (ZMM).
+//     Required floor: `gfni + avx512f + avx512bw`. Used on Ice Lake,
+//     Sapphire Rapids, Zen 4+, and any AVX-512 + GFNI part.
+//
+// Both replace the SSSE3 path's nibble-lookup math (8× `PSHUFB`
+// + 6× `XOR` per 32-byte iter) with affine-multiply math (4×
+// `GF2P8AFFINEQB` + 2× `XOR` per iter). The AVX-512 variant additionally
+// quadruples the per-iter symbol count; expected ~3–4× the 128-bit
+// kernel's per-core throughput on a server CPU where ZMM execution is
+// not throttled.
 
 #[cfg(target_arch = "x86_64")]
 mod simd {
@@ -246,7 +255,147 @@ mod simd {
             off += 2;
         }
     }
+
+    /// `output ^= coeff · input` using GFNI + AVX-512BW.
+    ///
+    /// Processes 128 bytes (64 GF(2^16) symbols) per iteration. Tail
+    /// bytes (< 128) fall through to the 128-bit kernel and then to
+    /// the scalar `apply_scalar` so behaviour matches the scalar
+    /// reference at every length.
+    ///
+    /// ## Shuffle layout (this is where bugs hide — read carefully)
+    ///
+    /// Input bytes 0..127 are interpreted as 64 GF(2^16) symbols stored
+    /// `[lo0, hi0, lo1, hi1, …, lo63, hi63]`. We process two ZMMs of
+    /// input per iter (64 bytes each = 32 symbols each).
+    ///
+    /// **Step 1 (per-lane VPSHUFB deinterleave).** Each 16-byte lane of
+    /// each ZMM holds 8 interleaved symbols. The lane-local PSHUFB index
+    ///   `[0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15]`
+    /// rearranges each lane into `[lo×8 | hi×8]`. Result per ZMM (8
+    /// qwords): qwords {0,2,4,6} hold low-byte runs of 8 symbols each;
+    /// qwords {1,3,5,7} hold the corresponding high-byte runs.
+    ///
+    /// **Step 2 (VPERMI2Q cross-lane gather).** Collect all low-byte
+    /// qwords from both deinterleaved ZMMs into one ZMM_all_lows (64
+    /// low bytes from 64 symbols), and similarly ZMM_all_highs. With
+    /// `permutex2var_epi64(a, idx, b)` selecting `a[idx[j] & 7]` when
+    /// `idx[j] < 8` and `b[idx[j] - 8]` when `idx[j] >= 8`:
+    ///   perm_lo = `[0, 2, 4, 6, 8, 10, 12, 14]`
+    ///   perm_hi = `[1, 3, 5, 7, 9, 11, 13, 15]`
+    ///
+    /// **Step 3 (GFNI math).** Identical to the 128-bit kernel, just
+    /// 4× wider. Each `_mm512_gf2p8affine_epi64_epi8` broadcasts its
+    /// 8-byte matrix to all 8 qwords of the result.
+    ///
+    /// **Step 4 (VPERMI2Q re-interleave qword-level).** Inverse of
+    /// step 2 with `a=out_lo, b=out_hi`:
+    ///   perm_inter0 = `[0, 8, 1, 9, 2, 10, 3, 11]`  → first output ZMM
+    ///   perm_inter1 = `[4, 12, 5, 13, 6, 14, 7, 15]` → second output ZMM
+    /// After this each lane holds `[lo×8 | hi×8]` ready for step 5.
+    ///
+    /// **Step 5 (per-lane VPSHUFB interleave).** Within each 16-byte
+    /// lane, weave lows and highs back together:
+    ///   `[0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15]`
+    /// yields `[lo0, hi0, lo1, hi1, …]` per lane — the original PAR2
+    /// layout.
+    ///
+    /// # Safety
+    /// Caller must ensure `gfni`, `avx512f`, and `avx512bw` are
+    /// runtime-available. `detect_dispatch` enforces this.
+    /// `input.len() == output.len()` and `input.len() % 2 == 0` are
+    /// asserted in debug builds.
+    #[target_feature(enable = "gfni,avx512f,avx512bw")]
+    pub(in crate::galois_simd) unsafe fn gf_mul_xor_gfni_avx512(
+        t: &GfniTables,
+        input: &[u8],
+        output: &mut [u8],
+    ) {
+        debug_assert_eq!(input.len(), output.len());
+        debug_assert_eq!(input.len() % 2, 0);
+
+        // Broadcast each 8-byte affine matrix across all 8 qword lanes
+        // of a ZMM so GF2P8AFFINEQB applies the same matrix to every
+        // byte of the data ZMM.
+        let m_ll = _mm512_set1_epi64(t.mat_ll as i64);
+        let m_lh = _mm512_set1_epi64(t.mat_lh as i64);
+        let m_hl = _mm512_set1_epi64(t.mat_hl as i64);
+        let m_hh = _mm512_set1_epi64(t.mat_hh as i64);
+
+        // Per-lane deinterleave (lane-local PSHUFB; the same 16-byte
+        // index is broadcast to all 4 lanes of the ZMM).
+        let deint_idx_lane = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
+        let deint_idx = _mm512_broadcast_i32x4(deint_idx_lane);
+
+        // Per-lane re-interleave (inverse of deint_idx_lane).
+        let inter_idx_lane = _mm_setr_epi8(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
+        let inter_idx = _mm512_broadcast_i32x4(inter_idx_lane);
+
+        // Cross-lane gather indices.
+        let perm_lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+        let perm_hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+        let perm_inter0 = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+        let perm_inter1 = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+
+        let chunks = input.len() / 128;
+        for c in 0..chunks {
+            let off = c * 128;
+            let v0 = _mm512_loadu_si512(input.as_ptr().add(off) as *const _);
+            let v1 = _mm512_loadu_si512(input.as_ptr().add(off + 64) as *const _);
+
+            // Step 1: per-lane deinterleave.
+            let d0 = _mm512_shuffle_epi8(v0, deint_idx);
+            let d1 = _mm512_shuffle_epi8(v1, deint_idx);
+
+            // Step 2: cross-lane gather lows from both ZMMs, then highs.
+            let all_lows = _mm512_permutex2var_epi64(d0, perm_lo, d1);
+            let all_highs = _mm512_permutex2var_epi64(d0, perm_hi, d1);
+
+            // Step 3: GFNI math.
+            let out_lo = _mm512_xor_si512(
+                _mm512_gf2p8affine_epi64_epi8::<0>(all_lows, m_ll),
+                _mm512_gf2p8affine_epi64_epi8::<0>(all_highs, m_lh),
+            );
+            let out_hi = _mm512_xor_si512(
+                _mm512_gf2p8affine_epi64_epi8::<0>(all_lows, m_hl),
+                _mm512_gf2p8affine_epi64_epi8::<0>(all_highs, m_hh),
+            );
+
+            // Step 4: qword-level re-interleave.
+            let mix0 = _mm512_permutex2var_epi64(out_lo, perm_inter0, out_hi);
+            let mix1 = _mm512_permutex2var_epi64(out_lo, perm_inter1, out_hi);
+
+            // Step 5: per-lane byte-level re-interleave.
+            let r0 = _mm512_shuffle_epi8(mix0, inter_idx);
+            let r1 = _mm512_shuffle_epi8(mix1, inter_idx);
+
+            // XOR into output buffer.
+            let dst0 = _mm512_loadu_si512(output.as_ptr().add(off) as *const _);
+            let dst1 = _mm512_loadu_si512(output.as_ptr().add(off + 64) as *const _);
+            _mm512_storeu_si512(
+                output.as_mut_ptr().add(off) as *mut _,
+                _mm512_xor_si512(dst0, r0),
+            );
+            _mm512_storeu_si512(
+                output.as_mut_ptr().add(off + 64) as *mut _,
+                _mm512_xor_si512(dst1, r1),
+            );
+        }
+
+        // Tail: drop to the 128-bit kernel for the next-largest chunk,
+        // then scalar for the final < 32 bytes. Reuses identical math
+        // so the result stays byte-exact at every length.
+        let consumed = chunks * 128;
+        if consumed < input.len() {
+            // SAFETY: this function's `target_feature` enables `gfni`,
+            // which implies SSSE3 on every shipping GFNI part (and we
+            // re-checked it explicitly in `detect_dispatch`). The
+            // narrower kernel only requires `gfni,ssse3`, both of
+            // which are available here.
+            gf_mul_xor_gfni(t, &input[consumed..], &mut output[consumed..]);
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub(super) use simd::gf_mul_xor_gfni;
+pub(super) use simd::{gf_mul_xor_gfni, gf_mul_xor_gfni_avx512};

@@ -200,29 +200,32 @@ shared cache for best results.
 The Reed-Solomon inner loop dispatches to the fastest GF kernel available
 on the host CPU. Runtime detection picks one of:
 
-| Dispatch       | Hardware required           | Inner loop                                                |
-|----------------|-----------------------------|-----------------------------------------------------------|
-| `Neon`         | aarch64 (base ISA)          | `vqtbl1q_u8` nibble lookup, 32 bytes/iter                 |
-| `Gfni`         | x86_64 with `gfni + ssse3`  | `GF2P8AFFINEQB` affine, 32 bytes/iter (~1.5–2× SSSE3)     |
-| `Ssse3`        | x86_64 with `ssse3`         | `PSHUFB` nibble lookup, 32 bytes/iter                     |
-| `TableScalar`  | any                         | Two 256-entry u16 lookup tables per coefficient           |
-| `Scalar`       | any                         | Per-symbol log/antilog (correctness reference)            |
+| Dispatch       | Hardware required                            | Inner loop                                               |
+|----------------|----------------------------------------------|----------------------------------------------------------|
+| `Neon`         | aarch64 (base ISA)                           | `vqtbl1q_u8` nibble lookup, 32 bytes/iter                |
+| `GfniAvx512`   | x86_64 with `gfni + avx512f + avx512bw`      | `VGF2P8AFFINEQB` affine, 128 bytes/iter (ZMM)            |
+| `Gfni`         | x86_64 with `gfni + ssse3`                   | `GF2P8AFFINEQB` affine, 32 bytes/iter (XMM)              |
+| `Ssse3`        | x86_64 with `ssse3`                          | `PSHUFB` nibble lookup, 32 bytes/iter                    |
+| `TableScalar`  | any                                          | Two 256-entry u16 lookup tables per coefficient          |
+| `Scalar`       | any                                          | Per-symbol log/antilog (correctness reference)           |
 
-Bench harness: `cargo bench --bench gf_kernel`. Measures wall-clock
-throughput on a 1 MiB L2-resident buffer; the dispatch name in the
-group label tells you which kernel ran. Indicative numbers:
+Runtime detection picks the widest available variant. Bench harness:
+`cargo bench --bench gf_kernel` — measures wall-clock throughput on
+a 1 MiB L2-resident buffer; the dispatch name in the Criterion group
+label tells you which kernel ran. Indicative numbers:
 
 | Kernel          | Hardware                  | 1 MiB throughput |
 |-----------------|---------------------------|------------------|
 | `Neon`          | Apple M4 (10 cores)       | ~20.8 GiB/s      |
-| `Gfni` / `Ssse3`| (run the bench on your x86 box to populate)              |
+| `GfniAvx512` / `Gfni` / `Ssse3` | (run the bench on your x86 box to populate)               |
 
-`Dispatch::Gfni` is preferred over `Ssse3` when both are available; the
-two share an identical 32-bytes-per-iter data layout and differ only in
-the per-iter math (4× `GF2P8AFFINEQB` + 2× `XOR` vs 8× `PSHUFB` + 6×
-`XOR`). AVX2 (256-bit) and AVX-512 (512-bit) GFNI variants are planned
-follow-ups; the 128-bit MVP is the lowest-risk introduction because
-every shuffle stays within a single 16-byte lane.
+The two GFNI variants share an identical `GfniTables` payload (four
+8-byte affine matrices) and differ only in vector width. The 128-bit
+kernel keeps every shuffle within a single 16-byte lane, so it
+sidesteps the cross-lane shuffle correctness risk of wider variants;
+the AVX-512 kernel quadruples the per-iter symbol count at the cost
+of two cross-lane `VPERMI2Q` permutes per iter. AVX2 (256-bit) GFNI
+is a planned follow-up for Alder/Raptor P-cores without AVX-512.
 
 ## Testing
 
