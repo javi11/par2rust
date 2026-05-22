@@ -65,7 +65,7 @@ impl SourceFile {
         if display_name.is_empty() || display_name.contains(&0) {
             return Err(Par2Error::InvalidFileName(path.to_path_buf()));
         }
-        if slice_size == 0 || slice_size % 4 != 0 {
+        if slice_size == 0 || !slice_size.is_multiple_of(4) {
             return Err(Par2Error::InvalidSliceSize(slice_size));
         }
 
@@ -185,7 +185,7 @@ pub(crate) fn scan_via_mmap(
                 if let Some(r) = reporter {
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     let is_last = d == total_slices;
-                    if is_last || d % stride == 0 {
+                    if is_last || d.is_multiple_of(stride) {
                         // Only emit if `d` is strictly newer than whatever a
                         // sibling worker already published. CAS-loop on
                         // `last_emitted` so concurrent ticks fold into one
@@ -278,7 +278,7 @@ fn scan_via_reader(
         if let Some(r) = reporter {
             let done = slice_checksums.len() as u64;
             let is_last = was_partial || done == total_slices;
-            if is_last || done % stride == 0 {
+            if is_last || done.is_multiple_of(stride) {
                 r.on_event(ProgressEvent::ScanProgress {
                     path,
                     slices_done: done,

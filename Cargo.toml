@@ -2,7 +2,8 @@
 name = "par2rust"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+# GFNI intrinsics (`_mm_gf2p8affine_epi64_epi8`) stabilized in Rust 1.89.
+rust-version = "1.89"
 description = "PAR2 file create-only port of par2cmdline in Rust"
 license = "GPL-2.0-or-later"
 

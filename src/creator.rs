@@ -159,7 +159,7 @@ pub fn run_create_with_progress(
     if opts.recovery_block_count > MAX_RECOVERY_BLOCKS {
         return Err(Par2Error::TooManyRecoveryBlocks(opts.recovery_block_count));
     }
-    if opts.slice_size == 0 || opts.slice_size % 4 != 0 {
+    if opts.slice_size == 0 || !opts.slice_size.is_multiple_of(4) {
         return Err(Par2Error::InvalidSliceSize(opts.slice_size));
     }
 
@@ -391,7 +391,7 @@ pub fn run_create_fused(
     if opts.recovery_block_count > MAX_RECOVERY_BLOCKS {
         return Err(Par2Error::TooManyRecoveryBlocks(opts.recovery_block_count));
     }
-    if opts.slice_size == 0 || opts.slice_size % 4 != 0 {
+    if opts.slice_size == 0 || !opts.slice_size.is_multiple_of(4) {
         return Err(Par2Error::InvalidSliceSize(opts.slice_size));
     }
     let slice_size = opts.slice_size;
@@ -735,7 +735,7 @@ fn encode_file_slices_into_buffers(
         // progress event.
         let done = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(r) = reporter {
-            if done == total_input_blocks || done % progress_stride == 0 {
+            if done == total_input_blocks || done.is_multiple_of(progress_stride) {
                 r.on_event(ProgressEvent::EncodeProgress {
                     volume_index: 0,
                     input_block_done: done,
@@ -877,7 +877,7 @@ fn encode_all_recovery_blocks(
 
         if let Some(r) = reporter {
             let done = (input_idx as u64) + 1;
-            if done == input_blocks_total || done % progress_stride == 0 {
+            if done == input_blocks_total || done.is_multiple_of(progress_stride) {
                 r.on_event(ProgressEvent::EncodeProgress {
                     volume_index: 0,
                     input_block_done: done,
