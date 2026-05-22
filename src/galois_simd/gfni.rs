@@ -17,7 +17,9 @@
 //! Given an 8x8 GF(2) matrix `M` packed into a u64 and an input byte
 //! `x`, GF2P8AFFINEQB computes per output bit `i`:
 //!
-//!     y[i] = parity(qword.byte[7 - i] AND x) XOR imm[i]
+//! ```text
+//! y[i] = parity(qword.byte[7 - i] AND x) XOR imm[i]
+//! ```
 //!
 //! with `imm = 0` for our use. The packing is:
 //!   - row `i` of the matrix lives in qword byte `7 - i` (byte 0 holds
@@ -43,8 +45,11 @@
 //!   | mat_hh   | 8..16 (hi)  | 8..16 (hi) |
 //!
 //! and at apply time:
-//!   out_lo = M_ll · x_lo  XOR  M_lh · x_hi
-//!   out_hi = M_hl · x_lo  XOR  M_hh · x_hi
+//!
+//! ```text
+//! out_lo = M_ll · x_lo  XOR  M_lh · x_hi
+//! out_hi = M_hl · x_lo  XOR  M_hh · x_hi
+//! ```
 
 use crate::galois::gf_mul;
 
