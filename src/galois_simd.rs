@@ -442,6 +442,11 @@ pub enum Dispatch {
     Neon,
     #[cfg(target_arch = "x86_64")]
     Ssse3,
+    /// GFNI + SSSE3 — 128-bit body using `GF2P8AFFINEQB`. Preferred over
+    /// `Ssse3` when both are available; replaces the per-iter 8× `PSHUFB`
+    /// nibble-lookup math with 4× affine ops.
+    #[cfg(target_arch = "x86_64")]
+    Gfni,
 }
 
 /// Select the fastest available SIMD path on this machine. Called once at
@@ -454,6 +459,12 @@ pub fn detect_dispatch() -> Dispatch {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        // GFNI implies SSSE3 in practice on every shipping part, but
+        // gate explicitly so the SIMD body's PSHUFB-based deinterleave
+        // (`#[target_feature(enable = "gfni,ssse3")]`) is sound.
+        if std::is_x86_feature_detected!("gfni") && std::is_x86_feature_detected!("ssse3") {
+            return Dispatch::Gfni;
+        }
         if std::is_x86_feature_detected!("ssse3") {
             return Dispatch::Ssse3;
         }
@@ -489,6 +500,10 @@ pub enum CoeffSimdTables {
     Neon(neon::NeonTables),
     #[cfg(target_arch = "x86_64")]
     Ssse3(x86::X86Tables),
+    /// GFNI affine-matrix tables. Four 8-byte matrices = 32 bytes total,
+    /// the smallest per-coefficient state of any SIMD variant.
+    #[cfg(target_arch = "x86_64")]
+    Gfni(gfni::GfniTables),
 }
 
 impl CoeffSimdTables {
@@ -513,6 +528,8 @@ impl CoeffSimdTables {
                 let byte_tables = CoeffTables::new(coeff);
                 CoeffSimdTables::Ssse3(x86::X86Tables::from_coeff_tables(&byte_tables))
             }
+            #[cfg(target_arch = "x86_64")]
+            Dispatch::Gfni => CoeffSimdTables::Gfni(gfni::GfniTables::from_coeff(coeff)),
         }
     }
 }
@@ -543,6 +560,13 @@ pub fn gf_mul_xor_with_tables(tables: &CoeffSimdTables, input: &[u8], output: &m
             // when the caller passed `Dispatch::Ssse3`, which itself only comes
             // from `detect_dispatch()` after a runtime SSSE3 check.
             unsafe { x86::gf_mul_xor_ssse3(t, input, output) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        CoeffSimdTables::Gfni(t) => {
+            // SAFETY: Gfni is only constructed when `detect_dispatch` saw
+            // both `gfni` and `ssse3` at runtime — matching the kernel's
+            // `#[target_feature(enable = "gfni,ssse3")]`.
+            unsafe { gfni::gf_mul_xor_gfni(t, input, output) };
         }
     }
 }
@@ -651,6 +675,25 @@ mod tests {
                     c,
                     sym,
                 );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn gfni_matches_scalar_when_available() {
+        if !std::is_x86_feature_detected!("gfni") || !std::is_x86_feature_detected!("ssse3") {
+            eprintln!("skipping: GFNI / SSSE3 not available on this CPU");
+            return;
+        }
+        let coeffs = [0x0002u16, 0x00FF, 0x1234, 0xABCD, 0xFFFE, 0xFFFF];
+        // Cover the SIMD body (multiples of 32) and the scalar tail
+        // (everything < 32 and the remainder past the last full chunk).
+        let lengths = [2usize, 4, 30, 32, 34, 62, 64, 96, 100, 1024, 4096, 4098];
+        for &coeff in &coeffs {
+            for &len in &lengths {
+                let input = deterministic((coeff as u64).rotate_left(7) ^ len as u64, len);
+                check_against_scalar(coeff, &input, Dispatch::Gfni);
             }
         }
     }
