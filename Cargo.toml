@@ -2,13 +2,19 @@
 name = "par2rust"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+# GFNI intrinsics (`_mm_gf2p8affine_epi64_epi8`) stabilized in Rust 1.89.
+rust-version = "1.89"
 description = "PAR2 file create-only port of par2cmdline in Rust"
 license = "GPL-2.0-or-later"
 
 [features]
 default = ["cli"]
 cli = ["dep:clap", "dep:indicatif", "dep:walkdir"]
+# Replace the pure-Rust md-5 backend with OpenSSL's hand-tuned MD5
+# (ARM asm on Apple Silicon, AVX/AVX-512 on x86) — typically 2-3× the
+# throughput of `md-5` on aarch64. Adds a native dep; consumers who
+# can't afford the OpenSSL build keep the default `md-5` path.
+fast-md5 = ["dep:openssl"]
 
 [dependencies]
 md-5 = "0.10"
@@ -19,9 +25,12 @@ walkdir = { version = "2", optional = true }
 thiserror = "1"
 cpufeatures = "0.2"
 rayon = "1.10"
+memmap2 = "0.9"
+openssl = { version = "0.10", optional = true, features = ["vendored"] }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bin]]
 name = "par2rust"
@@ -29,6 +38,10 @@ required-features = ["cli"]
 
 [[example]]
 name = "create_from_lib"
+
+[[bench]]
+name = "gf_kernel"
+harness = false
 
 [profile.release]
 opt-level = 3
