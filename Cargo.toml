@@ -43,6 +43,10 @@ name = "create_from_lib"
 name = "gf_kernel"
 harness = false
 
+[[bench]]
+name = "md5_scan"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
