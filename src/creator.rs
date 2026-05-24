@@ -264,29 +264,56 @@ pub fn run_create_with_progress(
         // are emitted with `total_volumes = 1` from inside
         // `encode_all_recovery_blocks`, so consumers see one contiguous
         // encode phase followed by a burst of `VolumeWritten` events.
-        let mut first_exp: u32 = 0;
-        for count in sizes.into_iter() {
-            // first_exp + count <= recovery_block_count <= 65535, so the u16
-            // cast is always safe — we validated the total against
-            // MAX_RECOVERY_BLOCKS above.
-            let first_exp_u16: u16 = first_exp
-                .try_into()
-                .expect("first_exp fits in u16 because total <= MAX_RECOVERY_BLOCKS");
-            let vol_path = derive_volume_filename(&opts.output, first_exp_u16, count);
-            let r_start = first_exp as usize;
-            let r_end = r_start + count as usize;
-            let vol_bytes = build_volume_packet(
-                &set_id_hash,
-                &critical_packets,
-                &recovery_buffers[r_start..r_end],
-                first_exp_u16,
-            );
-            write_atomic(&vol_path, &vol_bytes)?;
-            if let Some(r) = reporter {
-                r.on_event(ProgressEvent::VolumeWritten { path: &vol_path });
+        //
+        // Volume serialisation (`build_volume_packet`) is pure CPU and
+        // `write_atomic` writes to an independent path per volume — no
+        // shared state between volumes. Parallelise both via rayon to
+        // overlap the write-phase tail latency on multi-volume workloads
+        // (e.g. exponential split → 7 volumes on a 3.5 GiB workload).
+        // On NVMe arrays, parallel writes can saturate per-queue bandwidth
+        // that a sequential loop leaves on the table; on single SSDs the
+        // win is small but never a regression because each `write_atomic`
+        // is independent. `VolumeWritten` events emit in completion order
+        // (not volume order) — consumers should not depend on ordering
+        // across events of different kinds anyway.
+        let volumes: Vec<(u16, u32)> = {
+            let mut acc = Vec::with_capacity(sizes.len());
+            let mut first_exp: u32 = 0;
+            for count in sizes {
+                let first_exp_u16: u16 = first_exp
+                    .try_into()
+                    .expect("first_exp fits in u16 because total <= MAX_RECOVERY_BLOCKS");
+                acc.push((first_exp_u16, count));
+                first_exp += count;
             }
-            written.push(vol_path);
-            first_exp += count;
+            acc
+        };
+
+        let recovery_ref = &recovery_buffers;
+        let critical_ref = &critical_packets;
+        let set_id_ref = &set_id_hash;
+        let opts_output = &opts.output;
+        let volume_paths: Vec<Result<PathBuf>> = volumes
+            .par_iter()
+            .map(|&(first_exp_u16, count)| {
+                let vol_path = derive_volume_filename(opts_output, first_exp_u16, count);
+                let r_start = first_exp_u16 as usize;
+                let r_end = r_start + count as usize;
+                let vol_bytes = build_volume_packet(
+                    set_id_ref,
+                    critical_ref,
+                    &recovery_ref[r_start..r_end],
+                    first_exp_u16,
+                );
+                write_atomic(&vol_path, &vol_bytes).map_err(Par2Error::Io)?;
+                if let Some(r) = reporter {
+                    r.on_event(ProgressEvent::VolumeWritten { path: &vol_path });
+                }
+                Ok(vol_path)
+            })
+            .collect();
+        for res in volume_paths {
+            written.push(res?);
         }
     }
 
