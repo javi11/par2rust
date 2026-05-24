@@ -15,6 +15,13 @@ cli = ["dep:clap", "dep:indicatif", "dep:walkdir"]
 # throughput of `md-5` on aarch64. Adds a native dep; consumers who
 # can't afford the OpenSSL build keep the default `md-5` path.
 fast-md5 = ["dep:openssl"]
+# Enable multi-buffer MD5 via vendored ISA-L crypto (aarch64 ASIMD only
+# in Phase 1; x86 SSE/AVX paths land in a follow-up). Adds a C/asm
+# build step; default off.
+mb-md5 = []
+
+[build-dependencies]
+cc = "1"
 
 [dependencies]
 md-5 = "0.10"
