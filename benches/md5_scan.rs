@@ -54,6 +54,43 @@ fn bench_md5_scan(c: &mut Criterion) {
         });
     });
 
+    // 4-lane NEON multi-buffer MD5 (aarch64 only). The realistic
+    // integration: batch slices in groups of 4 and lane them through
+    // `digest4`. Caller threads collect digests in scan order; the
+    // last incomplete batch (< 4 slices) would fall back to scalar
+    // — here SLICE_COUNT=200 is divisible by 4 so the fallback is
+    // exercised only by `_serial_mb` for the same workload.
+    #[cfg(target_arch = "aarch64")]
+    g.bench_function("serial_mb", |b| {
+        b.iter(|| {
+            let mut digests = Vec::with_capacity(SLICE_COUNT);
+            let slices: Vec<&[u8]> = buf.chunks(SLICE_BYTES).collect();
+            for batch in slices.chunks(4) {
+                let mb = par2rust::md5_mb_neon::digest4([batch[0], batch[1], batch[2], batch[3]]);
+                digests.extend_from_slice(black_box(&mb));
+            }
+            digests
+        });
+    });
+
+    // Rayon + multi-buffer combined: outer rayon distributes batches
+    // of 4 slices across workers, each worker SIMD-lanes its batch.
+    // This is the target integration for scan_via_mmap.
+    #[cfg(target_arch = "aarch64")]
+    g.bench_function("rayon_mb", |b| {
+        b.iter(|| {
+            let slices: Vec<&[u8]> = buf.chunks(SLICE_BYTES).collect();
+            slices
+                .par_chunks(4)
+                .flat_map_iter(|batch| {
+                    let mb =
+                        par2rust::md5_mb_neon::digest4([batch[0], batch[1], batch[2], batch[3]]);
+                    mb.into_iter()
+                })
+                .collect::<Vec<_>>()
+        });
+    });
+
     g.finish();
 }
 
