@@ -398,10 +398,149 @@ mod x86 {
             );
         }
     }
+
+    /// AVX2 multiply-XOR. Processes 64 bytes (32 GF symbols) per
+    /// iteration using `vpshufb` for the nibble lookups. The 16-byte
+    /// `X86Tables` are broadcast to both 128-bit lanes of a YMM via
+    /// `vpbroadcasti128` so each per-lane PSHUFB sees the same lookup
+    /// table.
+    ///
+    /// ## Layout (this is where the math hides)
+    ///
+    /// `_mm256_shuffle_epi8` is per-128-bit-lane, so a single YMM
+    /// PSHUFB with the SSSE3 deinterleave index repeated in both
+    /// lanes does the per-lane half of the deinterleave for free.
+    /// `_mm256_unpacklo_epi64` is also per-lane, so combining two
+    /// shuffled YMMs gives:
+    ///
+    ///   `low_bytes_ymm` lane 0 = `[lows(0..7), lows(16..23)]`
+    ///   `low_bytes_ymm` lane 1 = `[lows(8..15), lows(24..31)]`
+    ///
+    /// This is NOT contiguous-by-symbol order, but the nibble lookups
+    /// don't care (byte-wise independent). Crucially, `_mm256_unpacklo_epi8`
+    /// at re-interleave time takes the LOW 8 bytes of each lane and
+    /// interleaves with the high YMM's low 8 bytes, producing per-lane
+    /// `[lo0,hi0,...,lo7,hi7]` for lane 0 and `[lo8,hi8,...,lo15,hi15]`
+    /// for lane 1 — exactly output bytes 0-31. `_mm256_unpackhi_epi8`
+    /// produces output bytes 32-63. The "scrambled" intermediate layout
+    /// cancels out by symmetry.
+    ///
+    /// # Safety
+    /// AVX2 must be enabled. (Tables are 16-byte, broadcast at function
+    /// entry to YMM.)
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn gf_mul_xor_avx2(tables: &X86Tables, input: &[u8], output: &mut [u8]) {
+        debug_assert_eq!(input.len(), output.len());
+        debug_assert_eq!(input.len() % 2, 0);
+
+        // Broadcast each 16-byte XMM table to a 256-bit YMM so per-lane
+        // VPSHUFB sees the same lookup table in both halves.
+        let t_lo_lo =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(tables.lo_lo.as_ptr() as *const __m128i));
+        let t_lo_hi =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(tables.lo_hi.as_ptr() as *const __m128i));
+        let t_lo_lo_n16 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+            tables.lo_lo_n16.as_ptr() as *const __m128i
+        ));
+        let t_lo_hi_n16 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+            tables.lo_hi_n16.as_ptr() as *const __m128i
+        ));
+        let t_hi_lo =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(tables.hi_lo.as_ptr() as *const __m128i));
+        let t_hi_hi =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(tables.hi_hi.as_ptr() as *const __m128i));
+        let t_hi_lo_n16 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+            tables.hi_lo_n16.as_ptr() as *const __m128i
+        ));
+        let t_hi_hi_n16 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+            tables.hi_hi_n16.as_ptr() as *const __m128i
+        ));
+        let mask_lo = _mm256_set1_epi8(0x0F);
+
+        // Same SSSE3 deinterleave indices, repeated in both YMM lanes.
+        // VPSHUFB is per-lane, so the second lane processes input
+        // bytes 16-31 (or 48-63 from v1) independently with the same
+        // even/odd extraction.
+        let lo_idx = _mm256_setr_epi8(
+            0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1, //
+            0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1,
+        );
+        let hi_idx = _mm256_setr_epi8(
+            1, 3, 5, 7, 9, 11, 13, 15, -1, -1, -1, -1, -1, -1, -1, -1, //
+            1, 3, 5, 7, 9, 11, 13, 15, -1, -1, -1, -1, -1, -1, -1, -1,
+        );
+
+        let chunks = input.len() / 64;
+        let mut consumed = 0usize;
+        for c in 0..chunks {
+            let off = c * 64;
+            let v0 = _mm256_loadu_si256(input.as_ptr().add(off) as *const __m256i);
+            let v1 = _mm256_loadu_si256(input.as_ptr().add(off + 32) as *const __m256i);
+
+            let lo_v0 = _mm256_shuffle_epi8(v0, lo_idx);
+            let lo_v1 = _mm256_shuffle_epi8(v1, lo_idx);
+            let low_bytes = _mm256_unpacklo_epi64(lo_v0, lo_v1);
+
+            let hi_v0 = _mm256_shuffle_epi8(v0, hi_idx);
+            let hi_v1 = _mm256_shuffle_epi8(v1, hi_idx);
+            let high_bytes = _mm256_unpacklo_epi64(hi_v0, hi_v1);
+
+            let low_lo_nib = _mm256_and_si256(low_bytes, mask_lo);
+            let low_hi_nib = _mm256_and_si256(_mm256_srli_epi16(low_bytes, 4), mask_lo);
+            let high_lo_nib = _mm256_and_si256(high_bytes, mask_lo);
+            let high_hi_nib = _mm256_and_si256(_mm256_srli_epi16(high_bytes, 4), mask_lo);
+
+            let prod_lo_byte = _mm256_xor_si256(
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(t_lo_lo, low_lo_nib),
+                    _mm256_shuffle_epi8(t_lo_lo_n16, low_hi_nib),
+                ),
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(t_hi_lo, high_lo_nib),
+                    _mm256_shuffle_epi8(t_hi_lo_n16, high_hi_nib),
+                ),
+            );
+            let prod_hi_byte = _mm256_xor_si256(
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(t_lo_hi, low_lo_nib),
+                    _mm256_shuffle_epi8(t_lo_hi_n16, low_hi_nib),
+                ),
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(t_hi_hi, high_lo_nib),
+                    _mm256_shuffle_epi8(t_hi_hi_n16, high_hi_nib),
+                ),
+            );
+
+            // See the doc comment: per-lane unpacklo/unpackhi on the
+            // scrambled-but-symmetric `prod_*_byte` layout produces
+            // output bytes 0-31 and 32-63 in correct PAR2 order.
+            let out_v0 = _mm256_unpacklo_epi8(prod_lo_byte, prod_hi_byte);
+            let out_v1 = _mm256_unpackhi_epi8(prod_lo_byte, prod_hi_byte);
+
+            let existing0 = _mm256_loadu_si256(output.as_ptr().add(off) as *const __m256i);
+            let existing1 = _mm256_loadu_si256(output.as_ptr().add(off + 32) as *const __m256i);
+            _mm256_storeu_si256(
+                output.as_mut_ptr().add(off) as *mut __m256i,
+                _mm256_xor_si256(existing0, out_v0),
+            );
+            _mm256_storeu_si256(
+                output.as_mut_ptr().add(off + 32) as *mut __m256i,
+                _mm256_xor_si256(existing1, out_v1),
+            );
+            consumed = off + 64;
+        }
+        // Tail (< 64 bytes): fall through to the 128-bit SSSE3 kernel,
+        // which itself handles its own 32-byte chunks + a scalar fall-
+        // through for the last < 32. Result is byte-identical to scalar
+        // at every length.
+        if consumed < input.len() {
+            gf_mul_xor_ssse3(tables, &input[consumed..], &mut output[consumed..]);
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use x86::{gf_mul_xor_ssse3, X86Tables};
+pub use x86::{gf_mul_xor_avx2, gf_mul_xor_ssse3, X86Tables};
 
 // --------------------------------------------------------------------------
 // GFNI (GF2P8AFFINEQB) affine-matrix derivation
@@ -442,9 +581,15 @@ pub enum Dispatch {
     Neon,
     #[cfg(target_arch = "x86_64")]
     Ssse3,
+    /// AVX2 256-bit body — same nibble-lookup math as `Ssse3` but 64
+    /// bytes (32 GF symbols) per iteration via `_mm256_shuffle_epi8`.
+    /// Picked over `Ssse3` on Haswell→Rocket Lake (and any AVX2 part
+    /// without GFNI). Tables are 16-byte `X86Tables` broadcast to YMM.
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
     /// GFNI + SSSE3 — 128-bit body using `GF2P8AFFINEQB`. Preferred over
-    /// `Ssse3` when both are available; replaces the per-iter 8× `PSHUFB`
-    /// nibble-lookup math with 4× affine ops.
+    /// `Avx2` / `Ssse3` when GFNI is available; replaces the per-iter 8×
+    /// `PSHUFB` nibble-lookup math with 4× affine ops.
     #[cfg(target_arch = "x86_64")]
     Gfni,
     /// GFNI + AVX-512BW — 512-bit body using `VGF2P8AFFINEQB` on ZMM.
@@ -476,6 +621,11 @@ pub fn detect_dispatch() -> Dispatch {
         }
         if std::is_x86_feature_detected!("gfni") && std::is_x86_feature_detected!("ssse3") {
             return Dispatch::Gfni;
+        }
+        // AVX2 implies SSSE3 on every shipping part. Prefer AVX2 over
+        // SSSE3 when available — same math, 2× per-iter width.
+        if std::is_x86_feature_detected!("avx2") {
+            return Dispatch::Avx2;
         }
         if std::is_x86_feature_detected!("ssse3") {
             return Dispatch::Ssse3;
@@ -512,6 +662,10 @@ pub enum CoeffSimdTables {
     Neon(neon::NeonTables),
     #[cfg(target_arch = "x86_64")]
     Ssse3(x86::X86Tables),
+    /// Identical 16-byte payload to [`CoeffSimdTables::Ssse3`]; the
+    /// variant tag selects the AVX2 256-bit kernel at dispatch time.
+    #[cfg(target_arch = "x86_64")]
+    Avx2(x86::X86Tables),
     /// GFNI affine-matrix tables. Four 8-byte matrices = 32 bytes total,
     /// the smallest per-coefficient state of any SIMD variant.
     #[cfg(target_arch = "x86_64")]
@@ -544,6 +698,11 @@ impl CoeffSimdTables {
             Dispatch::Ssse3 => {
                 let byte_tables = CoeffTables::new(coeff);
                 CoeffSimdTables::Ssse3(x86::X86Tables::from_coeff_tables(&byte_tables))
+            }
+            #[cfg(target_arch = "x86_64")]
+            Dispatch::Avx2 => {
+                let byte_tables = CoeffTables::new(coeff);
+                CoeffSimdTables::Avx2(x86::X86Tables::from_coeff_tables(&byte_tables))
             }
             #[cfg(target_arch = "x86_64")]
             Dispatch::Gfni => CoeffSimdTables::Gfni(gfni::GfniTables::from_coeff(coeff)),
@@ -581,6 +740,13 @@ pub fn gf_mul_xor_with_tables(tables: &CoeffSimdTables, input: &[u8], output: &m
             // when the caller passed `Dispatch::Ssse3`, which itself only comes
             // from `detect_dispatch()` after a runtime SSSE3 check.
             unsafe { x86::gf_mul_xor_ssse3(t, input, output) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        CoeffSimdTables::Avx2(t) => {
+            // SAFETY: Avx2 is only constructed when `detect_dispatch` saw
+            // `avx2` at runtime, matching the kernel's
+            // `#[target_feature(enable = "avx2")]`.
+            unsafe { x86::gf_mul_xor_avx2(t, input, output) };
         }
         #[cfg(target_arch = "x86_64")]
         CoeffSimdTables::Gfni(t) => {
@@ -765,6 +931,28 @@ mod tests {
             for &len in &lengths {
                 let input = deterministic(coeff as u64 ^ len as u64, len);
                 check_against_scalar(coeff, &input, Dispatch::Ssse3);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_matches_scalar_when_available() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: AVX2 not available on this CPU");
+            return;
+        }
+        let coeffs = [0x0002u16, 0x00FF, 0x1234, 0xABCD, 0xFFFE, 0xFFFF];
+        // Cover the SIMD body (multiples of 64) and the SSSE3-then-scalar
+        // tail fall-through. The interesting lengths cluster around the
+        // body boundary: 62 / 64 / 66 / 126 / 128 / 130.
+        let lengths = [
+            2usize, 4, 32, 34, 62, 64, 66, 96, 100, 126, 128, 130, 1024, 4096, 4098,
+        ];
+        for &coeff in &coeffs {
+            for &len in &lengths {
+                let input = deterministic((coeff as u64).rotate_left(5) ^ len as u64, len);
+                check_against_scalar(coeff, &input, Dispatch::Avx2);
             }
         }
     }
