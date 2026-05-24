@@ -43,6 +43,10 @@ name = "create_from_lib"
 name = "gf_kernel"
 harness = false
 
+[[bench]]
+name = "encoder_inner"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
