@@ -45,6 +45,8 @@ pub mod format;
 pub mod galois;
 pub mod galois_simd;
 pub(crate) mod md5_impl;
+#[cfg(target_arch = "aarch64")]
+pub mod md5_mb_neon;
 pub mod packet;
 pub mod progress;
 pub mod reedsolomon;
