@@ -82,10 +82,7 @@ fn main() {
                 .join("md5_mb_asimd_x4.S"),
         );
 
-    println!(
-        "cargo:rerun-if-changed={}",
-        vendor.join("md5_mb").display()
-    );
+    println!("cargo:rerun-if-changed={}", vendor.join("md5_mb").display());
     println!(
         "cargo:rerun-if-changed={}",
         vendor.join("include").display()
