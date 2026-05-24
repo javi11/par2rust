@@ -44,7 +44,7 @@ name = "gf_kernel"
 harness = false
 
 [[bench]]
-name = "encoder_inner"
+name = "md5_scan"
 harness = false
 
 [profile.release]
