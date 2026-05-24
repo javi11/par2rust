@@ -12,6 +12,46 @@ use rayon::prelude::*;
 /// nicely with the SIMD encode work, without spending much RAM.
 const ENCODE_READ_CAPACITY: usize = 4 * 1024 * 1024;
 
+/// Optional cache-blocking tile size for the encoder's inner loop.
+/// The encoder iterates ~`recovery_count / workers` recovery buffers
+/// per input slice; without tiling, the input slice is re-read from
+/// L2 (or DRAM) on every recovery-buffer touch.
+///
+/// Tiling by *input byte offset* keeps the currently-active input
+/// block hot in L1 across all the recovery-buffer XORs of one outer
+/// iteration. The theoretical win scales with how much the input
+/// slice exceeds the per-core L2.
+///
+/// **Default: tiling disabled.** Empirically the linear access
+/// pattern beats tiling on machines with large L2 + aggressive HW
+/// prefetchers (Apple M4: 20.5 GiB/s untiled vs 16.3 GiB/s tiled at
+/// 1 MiB slice × 200 recovery buffers — see `benches/encoder_inner.rs`).
+/// The tiling win lands on x86 cores with smaller L2 (Skylake / Zen 3
+/// at ~1 MiB per core), where the 200× input re-read genuinely hits
+/// DRAM. Without an x86 validation channel we ship the safe default
+/// and expose the knob.
+///
+/// Set `PAR2RUST_L2_BLOCK_BYTES=65536` (or any value ≥ 128 that is a
+/// multiple of 128) to enable tiling at that block size. Set to
+/// `0` (or unset) to disable.
+fn l2_block_bytes_opt() -> Option<usize> {
+    let s = std::env::var("PAR2RUST_L2_BLOCK_BYTES").ok()?;
+    match s.parse::<usize>() {
+        Ok(0) => None,
+        Ok(n) if n >= 128 && n.is_multiple_of(128) => Some(n),
+        Ok(n) => {
+            eprintln!(
+                "PAR2RUST_L2_BLOCK_BYTES={n} ignored (must be 0 or ≥128 and multiple of 128); tiling disabled"
+            );
+            None
+        }
+        Err(_) => {
+            eprintln!("PAR2RUST_L2_BLOCK_BYTES={s:?} ignored (not an integer); tiling disabled");
+            None
+        }
+    }
+}
+
 /// Sequential reader used by the single-pass encoder. Each source file is
 /// opened once and read strictly in order; the kernel's sequential readahead
 /// keeps the input pipeline fed while the SIMD encode work runs.
@@ -720,14 +760,41 @@ fn encode_file_slices_into_buffers(
 
         let tables_ref: &[CoeffSimdTables] = &coeff_tables;
         let slice_for_simd: &[u8] = slice_ref;
+        let block_opt = l2_block_bytes_opt();
         recovery_buffers
             .par_chunks_mut(chunk_len)
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
                 let base = chunk_idx * chunk_len;
-                for (offset, out) in chunk.iter_mut().enumerate() {
-                    let r_idx = base + offset;
-                    gf_mul_xor_with_tables(&tables_ref[r_idx], slice_for_simd, out);
+                match block_opt {
+                    None => {
+                        for (offset, out) in chunk.iter_mut().enumerate() {
+                            let r_idx = base + offset;
+                            gf_mul_xor_with_tables(&tables_ref[r_idx], slice_for_simd, out);
+                        }
+                    }
+                    Some(block_bytes) => {
+                        // Cache-blocked: for each B-byte window of the
+                        // input slice, iterate all the worker's recovery
+                        // buffers. The input window stays L1-hot across
+                        // the inner recovery loop. Wins on small-L2 x86;
+                        // see `l2_block_bytes_opt` for measured trade-off.
+                        let slice_len = slice_for_simd.len();
+                        let mut block_start = 0usize;
+                        while block_start < slice_len {
+                            let block_end = (block_start + block_bytes).min(slice_len);
+                            let input_block = &slice_for_simd[block_start..block_end];
+                            for (offset, out) in chunk.iter_mut().enumerate() {
+                                let r_idx = base + offset;
+                                gf_mul_xor_with_tables(
+                                    &tables_ref[r_idx],
+                                    input_block,
+                                    &mut out[block_start..block_end],
+                                );
+                            }
+                            block_start = block_end;
+                        }
+                    }
                 }
             });
 
@@ -862,16 +929,41 @@ fn encode_all_recovery_blocks(
 
         // Accumulate into every recovery buffer. Each buffer is disjoint, so
         // rayon hands out exclusive `&mut [u8]` slots with zero locking.
+        // Optionally cache-block via PAR2RUST_L2_BLOCK_BYTES — see
+        // `l2_block_bytes_opt` and the matching loop in
+        // `encode_file_slices_into_buffers`.
         let slice_ref: &[u8] = &slice_buf;
         let tables_ref: &[CoeffSimdTables] = &coeff_tables;
+        let block_opt = l2_block_bytes_opt();
         recovery_buffers
             .par_chunks_mut(chunk_len)
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
                 let base = chunk_idx * chunk_len;
-                for (offset, out) in chunk.iter_mut().enumerate() {
-                    let r_idx = base + offset;
-                    gf_mul_xor_with_tables(&tables_ref[r_idx], slice_ref, out);
+                match block_opt {
+                    None => {
+                        for (offset, out) in chunk.iter_mut().enumerate() {
+                            let r_idx = base + offset;
+                            gf_mul_xor_with_tables(&tables_ref[r_idx], slice_ref, out);
+                        }
+                    }
+                    Some(block_bytes) => {
+                        let slice_len = slice_ref.len();
+                        let mut block_start = 0usize;
+                        while block_start < slice_len {
+                            let block_end = (block_start + block_bytes).min(slice_len);
+                            let input_block = &slice_ref[block_start..block_end];
+                            for (offset, out) in chunk.iter_mut().enumerate() {
+                                let r_idx = base + offset;
+                                gf_mul_xor_with_tables(
+                                    &tables_ref[r_idx],
+                                    input_block,
+                                    &mut out[block_start..block_end],
+                                );
+                            }
+                            block_start = block_end;
+                        }
+                    }
                 }
             });
 
